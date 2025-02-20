@@ -1,0 +1,5 @@
+*.slurm
+*.err
+*.out
+
+__pycache__
