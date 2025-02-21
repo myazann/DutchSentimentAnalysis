@@ -1,28 +1,51 @@
 import random
 
-def get_emotion_labels():
+def get_emotion_labels(language="nl"):
 
-    return {
-        0: "geen emotie",
-        1: "woede", 
-        2: "afkeer",
-        3: "angst",
-        4: "geluk",
-        5: "verdriet",
-        6: "verrassing"
-    }
+    if language == "nl":
+        return {
+            0: "geen emotie",
+            1: "woede", 
+            2: "afkeer",
+            3: "angst",
+            4: "geluk",
+            5: "verdriet",
+            6: "verrassing"
+        }
 
-def get_emotion_labels_inverse():
+    else:
+        return {
+            0: "no emotion",
+            1: "anger", 
+            2: "disgust",
+            3: "fear",
+            4: "happiness",
+            5: "sadness",
+            6: "surprise"            
+        }
 
-    return {
-        "geen emotie": 0,
-        "woede": 1,
-        "afkeer": 2, 
-        "angst": 3,
-        "geluk": 4,
-        "verdriet": 5,
-        "verrassing": 6
-    }
+def get_emotion_labels_inverse(language="nl"):
+
+    if language == "nl":
+        return {
+            "geen emotie": 0,
+            "woede": 1,
+            "afkeer": 2, 
+            "angst": 3,
+            "geluk": 4,
+            "verdriet": 5,
+            "verrassing": 6
+        }
+    else:
+        return {
+            "no emotion": 0,
+            "anger": 1,
+            "disgust": 2, 
+            "fear": 3,
+            "happiness": 4,
+            "sadness": 5,
+            "surprise": 6           
+        }
 
 def get_translate_prompt():
 
@@ -47,61 +70,99 @@ def get_translate_prompt():
         }
     ]
 
-def get_classifier_prompt_nl():
+def get_classifier_prompt(language="nl"):
 
-    return [
+    if language == "nl":
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "Je bent een model voor emotieclassificatie. "
+                    "Je taak is om te bepalen welke van de volgende emoties het beste past bij de gegeven tekst: "
+                    "[geen emotie, woede, afkeer, angst, geluk, verdriet, verrassing]. "
+                    "Gebruik **geen andere klassen** dan deze. "
+                    "Als je een enkele tekst ontvangt, geef dan uitsluitend de voorspelde emotie als output, "
+                    "Indien er voorbeelden worden meegeleverd, gebruik deze als referentie, maar als er geen voorbeelden zijn, "
+                    "maak dan alsnog een voorspelling. "
+                    "Geef exact de vereiste output, zonder extra uitleg, whitespace of opmaak.\n\n"
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    "<Voorbeelden>"
+                    "{few_shot_examples}"
+                    "</Voorbeelden>\n"
+                    "Output:"
+                    "Analyseer de emotie(s) van de volgende tekst(zen):\n\n"
+                    "Input:\n{text}\n\n"
+                )
+            }
+        ]
+
+    else:
+
+        return [
         {
             "role": "system",
             "content": (
-                "Je bent een model voor emotieclassificatie. "
-                "Je taak is om te bepalen welke van de volgende emoties het beste past bij de gegeven tekst: "
-                "'geen emotie', 'woede', 'afkeer', 'angst', 'geluk', 'verdriet', 'verrassing'. "
-                "Als je een enkele tekst ontvangt, geef dan uitsluitend de voorspelde emotie als output, "
-                "correct geformatteerd als een Python-string omgeven door dubbele aanhalingstekens, bijvoorbeeld: \"geluk\". "
-                "Als je een lijst met teksten ontvangt, geef dan voor iedere tekst de corresponderende voorspelling, "
-                "en presenteer de resultaten als een Python-lijst van strings, bijvoorbeeld: [\"geluk\", \"verdriet\", \"geen emotie\"]. "
-                "De lijst moet correct geformatteerd zijn voor Python's eval()-functie: "
-                "gebruik dubbele aanhalingstekens voor elke string, gebruik komma's tussen de items zonder een komma na het laatste item, "
-                "en geef geen extra uitleg, whitespace of karakters buiten de lijst. "
-                "Indien er voorbeelden worden meegeleverd, gebruik deze als referentie, maar als er geen voorbeelden zijn, "
-                "maak dan alsnog een voorspelling. "
-                "Geef exact de vereiste output, zonder extra uitleg of opmaak."
+                "You are a model for emotion classification. "
+                "Your task is to determine which of the following emotions best fits the given text: "
+                "[no emotion, anger, disgust, fear, happiness, sadness, surprise]. "
+                "**Do not use any classes other than these.** "
+                "If you receive a single text, provide only the predicted emotion as output, "
+                "If examples are provided, use them as reference, but if there are no examples, "
+                "still make a prediction. "
+                "Provide exactly the required output, without extra explanation, whitespace, or formatting.\n\n"
             )
         },
         {
             "role": "user",
             "content": (
+                "<Examples>"
                 "{few_shot_examples}"
-                "Analyseer de emotie(s) van de volgende tekst(zen):\n\n"
+                "</Examples>\n"
+                "Analyze the emotion(s) of the following text(s):\n\n"
                 "Input:\n{text}\n\n"
-                "*Belangrijk*: Geef **uitsluitend** een emotie uit de volgende lijst als output: "
-                "[\"geen emotie\", \"woede\", \"afkeer\", \"angst\", \"geluk\", \"verdriet\", \"verrassing\"]. "
-                "Gebruik **geen andere klassen** dan deze. "
-                "De output moet correct geformatteerd zijn als een Python-lijst van strings, bijvoorbeeld: [\"geluk\", \"verdriet\"]. "
-                "Geef exact de vereiste output, zonder extra uitleg, whitespace of opmaak.\n\n"
                 "Output:"
             )
         }
     ]
 
-def get_few_shot_samples(dataset, translator, num_sample_per_class=1):
+def get_few_shot_samples(dataset, args, translator=None):
 
-    emotion_labels = get_emotion_labels()
+    emotion_labels = get_emotion_labels(args.language)
     label_indexes = {}
+    total_samples = 0
 
     for i, sample in enumerate(dataset["emotion"]):
         for j, turn in enumerate(sample):
             if label_indexes.get(emotion_labels[turn]) is None:
                 label_indexes[emotion_labels[turn]] = []
             label_indexes[emotion_labels[turn]].append((i, j))
+            total_samples += 1
 
     few_shot_examples = ""
 
-    for key in label_indexes.keys():
-        chosen_indexes = random.choices(label_indexes[key], k=num_sample_per_class)
-        for sample in chosen_indexes:
-            params = {"text": dataset["dialog"][sample[0]][sample[1]]}
-            translated_sequence = translator.generate(prompt_params=params)
-            few_shot_examples = f"{few_shot_examples}\n{translated_sequence}: {key}"
+    if args.proportional:
+        weights = {key: len(indexes) / total_samples 
+                  for key, indexes in label_indexes.items()}
+        
+        min_weight = min(weights.values())
+        max_weight = 10
+        
+        sample_counts = {key: min(max_weight, max(1, (round((args.few_k * (weight / min_weight))/max_weight))))
+                        for key, weight in weights.items()}
+    else:
+        sample_counts = {key: args.few_k for key in label_indexes.keys()}
 
-    return few_shot_examples    
+    for key in label_indexes.keys():
+        chosen_indexes = random.choices(label_indexes[key], k=sample_counts[key])
+        for sample in chosen_indexes:
+            example = dataset["dialog"][sample[0]][sample[1]]
+            if args.language == "nl":
+                params = {"text": example}
+                example = translator.generate(prompt_params=params)
+            few_shot_examples = f"{few_shot_examples}\n{example.strip()}: {key}"
+
+    return few_shot_examples
