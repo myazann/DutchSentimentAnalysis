@@ -7,7 +7,17 @@ gts = load_dataset("li2017dailydialog/daily_dialog")["test"]["emotion"]
 flattened_gts = [item for sublist in gts for item in sublist]
 
 pred_files = [f for f in os.listdir("files") if f.startswith("preds")]
+all_results = []
+
 for file in pred_files:
+    # Parse parameters from filename
+    params = file.replace("preds_", "").replace(".json", "").split("_")
+    if len(params) == 3:
+        continue
+    model = params[0]
+    language = params[1]
+    few_k = params[2].replace("k(", "").replace(")", "")
+    proportion = params[3].replace("p(", "").replace(")", "")
 
     with open(os.path.join("files", file), "r") as f:
         preds = json.load(f)
@@ -43,11 +53,36 @@ for file in pred_files:
         f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
         f1_scores.append(f1)
         
-        print(f"Class {cls}:")
-        print(f"  Accuracy: {class_accuracy}")
-        print(f"  F1 Score: {round(f1, 3)}")
+        all_results.append({
+            'model': model,
+            'language': language,
+            'few_k': few_k,
+            'proportion': proportion,
+            'class': cls,
+            'accuracy': class_accuracy,
+            'precision': round(precision, 3),
+            'recall': round(recall, 3),
+            'f1': round(f1, 3)
+        })
     
     macro_f1 = round(sum(f1_scores) / len(f1_scores), 3)
     
+    # Add overall scores
+    all_results.append({
+        'model': model,
+        'language': language,
+        'few_k': few_k,
+        'proportion': proportion,
+        'class': 'overall',
+        'accuracy': accuracy_score,
+        'precision': '-',
+        'recall': '-', 
+        'f1': macro_f1
+    })
+    
     print(f"\nOverall Accuracy: {accuracy_score}")
     print(f"Macro F1: {macro_f1}")
+
+# Create and save single DataFrame with all results
+df = pd.DataFrame(all_results)
+df.to_csv(os.path.join("files", 'all_results.csv'), index=False)
