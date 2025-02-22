@@ -26,6 +26,7 @@ for file in pred_files:
     accuracy = 0
 
     if len(flattened_gts) != len(flattened_preds):
+        print(f"Experiment not completed for: {file}")
         continue
 
     print(file)
