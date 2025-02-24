@@ -214,6 +214,7 @@ class LLM:
                         message["content"] = message["content"].format(**params)
                     except Exception as e:
                         raise ValueError("Error formatting prompt content: " + str(e))
+
         return prompt
 
     def get_avail_space(self, prompt):

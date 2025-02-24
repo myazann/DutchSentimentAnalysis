@@ -18,10 +18,9 @@ args = parser.parse_args()
 
 # llm_list = ["GPT-4o-mini"]
 translator = None
-llm_list = ["QWEN-2.5-72B-GGUF", "QWEN-2.5-7B-1M", "LLAMA-3.3-70B-GGUF", "QWEN-2.5-14B-1M"]
+llm_list = ["QWEN-2.5-72B-GGUF", "LLAMA-3.3-70B-GGUF", "QWEN-2.5-14B-GGUF"]
 
 if args.language == "nl":
-    llm_list.append("GEITJE-7B-ULTRA")
     translator_model_name = "GPT-4o-mini"
     translator = LLM(translator_model_name, default_prompt=get_translate_prompt())
 
@@ -46,7 +45,7 @@ if args.language == "nl":
         with open(translations_file, "r") as f:
             stored_translations = json.load(f)
     else:
-        stored_translations = {"translations": {}}
+        stored_translations = {"test": {}}
 
 emotion_labels_inverse = get_emotion_labels_inverse(args.language)
 
@@ -70,18 +69,19 @@ for llm in llm_list:
     all_res = []
     for _ in range(len(daily_dialog_test) - len(all_res)):
 
+        print(cont_idx)
         turn_preds = []
         turn_dialog = daily_dialog_test["dialog"][cont_idx]
 
         for turn in turn_dialog:    
 
             if args.language == "nl":
-                if turn in stored_translations["translations"]:
-                    text = stored_translations["translations"][turn]
+                if turn in stored_translations["test"]:
+                    text = stored_translations["test"][turn]
                 else:
                     translated_text = translator.generate(prompt_params={"text": turn})
-                    stored_translations["translations"][turn] = translated_text
-                    text = stored_translations["translations"][turn]
+                    stored_translations["test"][turn] = translated_text
+                    text = stored_translations["test"][turn]
                     with open(translations_file, "w") as f:
                         json.dump(stored_translations, f, indent=4)
             else:

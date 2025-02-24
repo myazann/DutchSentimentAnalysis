@@ -29,8 +29,6 @@ for file in pred_files:
         print(f"Experiment not completed for: {file}")
         continue
 
-    print(file)
-
     # Calculate accuracy
     for gt, pred in zip(flattened_gts, flattened_preds):
         if pred == gt:
@@ -80,9 +78,6 @@ for file in pred_files:
         'recall': '-', 
         'f1': macro_f1
     })
-    
-    print(f"\nOverall Accuracy: {accuracy_score}")
-    print(f"Macro F1: {macro_f1}")
 
 # Create and save single DataFrame with all results
 df = pd.DataFrame(all_results)
