@@ -45,4 +45,8 @@ for i, dialog in enumerate(daily_dialog):
 
         custom_id = f"{i}_{j}"
         res = [res["response"]["body"]["choices"][0]["message"]["content"] for res in all_batch_res if res["custom_id"] == custom_id]
-        out_dict[args.split][turn] = res[0].strip()
+        if res:
+            out_dict[args.split][turn] = " ".join(res).strip()
+
+with open(out_path, "w") as f:
+    json.dump(out_dict, f)

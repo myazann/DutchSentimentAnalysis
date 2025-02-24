@@ -51,13 +51,14 @@ tokenized_datasets.set_format("torch")
 model = RobertaForSequenceClassification.from_pretrained("pdelobelle/robbert-v2-dutch-base", num_labels=2)
 
 training_args = TrainingArguments(
-    output_dir="files",
+    output_dir="./results",
     evaluation_strategy="epoch",
     learning_rate=2e-5,
     per_device_train_batch_size=8,
     per_device_eval_batch_size=8,
     num_train_epochs=3,
     weight_decay=0.01,
+    load_best_model_at_end=True,
 )
 
 trainer = Trainer(

@@ -69,7 +69,6 @@ for llm in llm_list:
     all_res = []
     for _ in range(len(daily_dialog_test) - len(all_res)):
 
-        print(cont_idx)
         turn_preds = []
         turn_dialog = daily_dialog_test["dialog"][cont_idx]
 
