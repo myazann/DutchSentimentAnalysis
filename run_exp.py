@@ -10,15 +10,18 @@ from models import LLM
 from helpers import *
 
 parser = argparse.ArgumentParser()
-parser.add_argument("-k", "--few_k", default=1, type=int)
+parser.add_argument("-k", "--few_k", default=0, type=int)
 parser.add_argument("-lg", "--language", default="nl", type=str)
 parser.add_argument("-p", "--proportional", type=bool, default=False)
 parser.add_argument("-ob", "--openai_batch", default=False, action=argparse.BooleanOptionalAction)
 args = parser.parse_args()
 
+if args.few_k == 0:
+    args.proportional = True
+
 # llm_list = ["GPT-4o-mini"]
 translator = None
-llm_list = ["QWEN-2.5-72B-GGUF", "LLAMA-3.3-70B-GGUF", "QWEN-2.5-14B-GGUF"]
+llm_list = ["ROBBERT-EMOTION-FINETUNED", "QWEN-2.5-72B-GGUF", "LLAMA-3.3-70B-GGUF", "QWEN-2.5-14B-GGUF"]
 
 if args.language == "nl":
     translator_model_name = "GPT-4o-mini"
@@ -48,10 +51,15 @@ if args.language == "nl":
         stored_translations = {"test": {}}
 
 emotion_labels_inverse = get_emotion_labels_inverse(args.language)
+print(f"Language: {args.language}, Few shot k: {args.few_k}, Proportional: {args.proportional}")
 
-for llm in llm_list:
-    exp_name = f"preds_{llm}_{args.language}_k({args.few_k})_p({args.proportional})"
-    print(exp_name)
+for model_name in llm_list:
+    if args.few_k > 0 and "FINETUNED" in model_name:
+        continue
+        
+    exp_name = f"preds_{model_name}_{args.language}_k({args.few_k})_p({args.proportional})"
+    print(f"\n{model_name}")
+  
     all_res = []
 
     if os.path.exists(os.path.join("files", f"{exp_name}.json")):
@@ -60,7 +68,10 @@ for llm in llm_list:
         if len(all_res) == len(daily_dialog_test):
             continue
 
-    classifier = LLM(llm, default_prompt=get_classifier_prompt(args.language))
+    if "FINETUNED" in model_name:
+        classifier = LLM(model_name)
+    else:
+        classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language))
 
     subprocess.run("gpustat")
     cont_idx = copy.copy(len(all_res))
@@ -86,8 +97,12 @@ for llm in llm_list:
             else:
                 text = turn
             try:
-                pred = classifier.generate(prompt_params={"text": text, "few_shot_examples": few_shot_examples})
-                turn_preds.append(emotion_labels_inverse[pred])
+                if classifier.provider == "FINETUNED":
+                    pred = classifier.generate(prompt_params={"text": text})
+                else:
+                    pred = classifier.generate(prompt_params={"text": text, "few_shot_examples": few_shot_examples})
+                    pred = emotion_labels_inverse[pred]
+                turn_preds.append(pred)
             except Exception as e:
                 print(e)
                 turn_preds.append(-1)

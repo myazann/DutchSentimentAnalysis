@@ -3,3 +3,7 @@
 *.out
 
 __pycache__
+
+logs/
+finetune/
+wandb/

@@ -10,7 +10,9 @@ from llama_cpp import Llama
 from huggingface_hub import login, logging, hf_hub_download, snapshot_download
 logging.set_verbosity_error()
 import tiktoken
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, logging, BitsAndBytesConfig, AsyncTextIteratorStreamer
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification, pipeline, logging, BitsAndBytesConfig, AsyncTextIteratorStreamer
+from transformers import RobertaTokenizer, RobertaForSequenceClassification
+import torch
 logging.set_verbosity_error()
 
 from openai import OpenAI
@@ -49,6 +51,8 @@ class LLM:
             return "GROQ"
         elif self.model_name.endswith("GGUF"):
             return "GGUF"
+        elif self.model_name.endswith("FINETUNED"):
+            return "FINETUNED"
         elif self.cfg.get("provider"):
             return self.cfg.get("provider")  
         else:
@@ -56,7 +60,7 @@ class LLM:
         
     def init_tokenizer(self):
 
-        if self.provider in ["GROQ", "GGUF", "DEEPSEEK"]:
+        if self.cfg.get("tokenizer"):
             return AutoTokenizer.from_pretrained(self.cfg.get("tokenizer"), use_fast=True)
         elif self.provider in ["ANTHROPIC", "OPENAI", "GOOGLE"]:
             return None
@@ -146,6 +150,12 @@ class LLM:
                 len_files = len(os.listdir(model_path))
                 model_path = f"{model_path}/{self.file_name}-00001-of-0000{len_files}.gguf"
             return Llama(model_path=model_path, **self.model_params)
+        elif self.provider == "FINETUNED":
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model = AutoModelForSequenceClassification.from_pretrained(self.repo_id)
+            model.to(device)
+            model.eval()
+            return model
         else: 
             bnb_config = None
             if "quantization" in self.model_params:
@@ -162,49 +172,31 @@ class LLM:
                     device_map="auto")
 
     def format_prompt(self, prompt, params=None):
-        """
-        Ensure that the prompt is a list of dictionaries in the format:
-        [{"role": <role>, "content": <content>}, ...].
-        
-        - If prompt is None, use self.default_prompt.
-        - If prompt is a string, convert it into a list with one dict using role "user".
-        - If prompt is a list, any non-dict element is assumed to be a string and converted accordingly.
-        
-        If neither prompt nor self.default_prompt is provided, raise an error.
-        Then, if params are provided, format each message's content using str.format().
-        
-        :param prompt: A string, list (of dicts or strings), or None representing the prompt.
-        :param params: A dict of parameters to format the content strings.
-        :return: A standardized list of dicts with parameters injected.
-        """
-        # If prompt is None, use default_prompt
-        default_prompt = copy.deepcopy(self.default_prompt)
-        if prompt is None:
-            if default_prompt:
-                prompt = default_prompt
-            else:
-                raise ValueError("No prompt provided and no default prompt available.")
+        if self.provider == "FINETUNED":
+            return params.get("text", "")
 
+        if not prompt:
+            prompt = copy.deepcopy(self.default_prompt)
+        else:
+            prompt = copy.deepcopy(prompt)
+            
         # Normalize prompt into a list of dicts.
         if isinstance(prompt, str):
             prompt = [{"role": "user", "content": prompt}]
         elif isinstance(prompt, list):
-            new_prompt = []
-            for item in prompt:
-                if isinstance(item, dict):
-                    new_prompt.append(item)
-                elif isinstance(item, str):
-                    new_prompt.append({"role": "user", "content": item})
-                else:
-                    raise ValueError("Each item in the prompt list must be either a dict or a string.")
-            prompt = new_prompt
+            # Convert any string elements to dicts
+            prompt = [
+                {"role": "user", "content": msg} if isinstance(msg, str)
+                else copy.deepcopy(msg)
+                for msg in prompt
+            ]
         else:
-            raise TypeError("Prompt must be either a string, a list, or None.")
+            raise ValueError(f"Prompt must be string or list, got {type(prompt)}")
 
         # If a default prompt exists and prompt was not already the default,
-        # prepend the default_prompt (avoid duplicating if prompt came from default_prompt).
-        if not (prompt == default_prompt) and self.default_prompt:
-            prompt = default_prompt + prompt
+        # prepend the default_prompt
+        if self.default_prompt and not (prompt == self.default_prompt):
+            prompt = copy.deepcopy(self.default_prompt) + prompt
 
         # Format each message's content if parameters are provided.
         if params and isinstance(params, dict):
@@ -273,6 +265,9 @@ class LLM:
 
     def generate(self, prompt=None, stream=False, gen_params=None, prompt_params=None):
 
+        if prompt_params is None:
+            prompt_params = {}
+        
         prompt = self.format_prompt(prompt, prompt_params)
 
         if not gen_params:
@@ -305,7 +300,7 @@ class LLM:
                                 finished_thinking_yielded = True
                             yield delta.content
                     if has_reasoning and not finished_thinking_yielded:
-                        yield "\n\n\n**Finished Thinking!**\n\n\n"
+                        yield "\n\n\n**Finished Thinking!**"
                 return stream_response()
                         
             output = response.choices[0].message.content
@@ -342,6 +337,16 @@ class LLM:
                 messages, generation_config=genai.types.GenerationConfig(**gen_params)
             )
             output = response.text 
+
+        elif self.provider == "FINETUNED":
+            text = prompt_params.get("text", "")
+            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+            device = next(self.model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                probs = outputs.logits.softmax(dim=-1)
+                return probs.argmax(dim=-1).item()
 
         else:
             if self.family in ["MISTRAL", "GEMMA"]:

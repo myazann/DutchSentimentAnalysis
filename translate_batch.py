@@ -36,12 +36,10 @@ MAX_NEW_TOKENS = 128
 
 llm = LLM("GPT-4o-mini")
 
-# Split dialogs into two halves
 half_length = len(daily_dialog) // 2
 first_half = daily_dialog[:half_length]
 second_half = daily_dialog[half_length:]
 
-# Process first half
 file_name_1 = os.path.join("files", f"batch_{llm.repo_id}_{args.split}_{args.language}_translations_1.jsonl")
 for i, dialog in enumerate(first_half):
     for j, turn in enumerate(dialog):
@@ -60,7 +58,7 @@ for i, dialog in enumerate(second_half):
         translate_prompt = get_translate_prompt()
         prompt = llm.format_prompt(translate_prompt, {"text": turn})
         with open(file_name_2, "a+") as file:
-            json_line = json.dumps({"custom_id": f"{i}_{j}", "method": "POST", "url": "/v1/chat/completions",
+            json_line = json.dumps({"custom_id": f"{half_length+i}_{j}", "method": "POST", "url": "/v1/chat/completions",
                                   "body": {"model": llm.repo_id,
                                   "messages": prompt, "max_tokens": MAX_NEW_TOKENS}})
             file.write(json_line + '\n')
