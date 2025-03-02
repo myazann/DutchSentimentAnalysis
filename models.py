@@ -19,6 +19,8 @@ from openai import OpenAI
 from anthropic import Anthropic
 import google.generativeai as genai
 
+# Import helpers for emotion labels
+from helpers import get_emotion_labels
 
 class LLM:
 
@@ -31,6 +33,7 @@ class LLM:
         self.repo_id = self.cfg.get("repo_id")
         self.file_name = self.cfg.get("file_name", None)
         self.context_length = int(self.cfg.get("context_length"))
+        self.finetune_path = os.path.join("finetune", self.repo_id.split("/")[-1])
         self.provider = self.get_provider()
         self.tokenizer = self.init_tokenizer()
         self.model_params = self.get_model_params(model_params)
@@ -61,11 +64,30 @@ class LLM:
     def init_tokenizer(self):
 
         if self.cfg.get("tokenizer"):
-            return AutoTokenizer.from_pretrained(self.cfg.get("tokenizer"), use_fast=True)
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.cfg.get("tokenizer"), 
+                use_fast=True,
+                model_max_length=512,  
+                padding_side="right"   
+            )
         elif self.provider in ["ANTHROPIC", "OPENAI", "GOOGLE"]:
             return None
         else:
-            return AutoTokenizer.from_pretrained(self.repo_id, use_fast=True)
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.repo_id, 
+                use_fast=True,
+                model_max_length=512,  
+                padding_side="right"   
+            )
+        
+        # Configure padding token for tokenizers that don't have one (like LLaMA)
+        if tokenizer.pad_token is None:
+            if tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                
+        return tokenizer
             
     def get_gen_params(self, gen_params):
 
@@ -128,13 +150,15 @@ class LLM:
     
     def init_model(self):
 
-        if self.provider == "ANTHROPIC":
+        if self.provider == "OPENAI":
+            return OpenAI(**self.model_params)
+        elif self.provider == "ANTHROPIC":
             return Anthropic(**self.model_params)
-        elif self.provider in ["OPENAI", "GROQ", "DEEPSEEK"]:
-            return OpenAI(**self.model_params)       
         elif self.provider == "GOOGLE":
             genai.configure(**self.model_params)
-            return genai.GenerativeModel(self.repo_id)
+            return genai.GenerativeModel(self.repo_id, )
+        elif self.provider == "GROQ":
+            return OpenAI(**self.model_params)
         elif self.provider == "GGUF":
             if os.getenv("HF_HOME") is None:
                 hf_cache_path = os.path.join(os.path.expanduser('~'), ".cache", "huggingface", "hub")
@@ -151,10 +175,40 @@ class LLM:
                 model_path = f"{model_path}/{self.file_name}-00001-of-0000{len_files}.gguf"
             return Llama(model_path=model_path, **self.model_params)
         elif self.provider == "FINETUNED":
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            model = AutoModelForSequenceClassification.from_pretrained(self.repo_id)
-            model.to(device)
-            model.eval()
+            model_path = os.path.join(self.finetune_path, "final_model")
+            if os.path.exists(model_path):
+                # Check if this is a LLaMA model
+                if "LLAMA" in self.model_name:
+                    print(f"Loading fine-tuned LLaMA model from {model_path}")
+                    # For LLaMA models, we need to use AutoModelForSequenceClassification
+                    
+                    model = AutoModelForSequenceClassification.from_pretrained(
+                        model_path, 
+                        **self.model_params,
+                        torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32,
+                        low_cpu_mem_usage=True
+                    )
+                else:
+                    model = AutoModelForSequenceClassification.from_pretrained(model_path, **self.model_params)
+            else:
+                print("Couldn't find the finetuned model, initializing with the original model")
+                # Special handling for LLaMA models for classification
+                if "LLAMA" in self.model_name:
+                    print(f"Initializing LLaMA model for classification: {self.repo_id}")
+                    # For LLaMA, we'll use AutoModelForSequenceClassification directly
+                    model = AutoModelForSequenceClassification.from_pretrained(
+                        self.repo_id,
+                        **self.model_params,
+                        torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32,
+                        low_cpu_mem_usage=True
+                    )
+                else:
+                    model = AutoModelForSequenceClassification.from_pretrained(self.repo_id, **self.model_params)
+            
+            if model is not None:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                model.to(device)
+                model.eval()
             return model
         else: 
             bnb_config = None
@@ -168,8 +222,7 @@ class LLM:
                     self.repo_id,
                     **self.model_params,
                     quantization_config=bnb_config,
-                    low_cpu_mem_usage=True,
-                    device_map="auto")
+                    low_cpu_mem_usage=True)
 
     def format_prompt(self, prompt, params=None):
         if self.provider == "FINETUNED":
@@ -340,13 +393,37 @@ class LLM:
 
         elif self.provider == "FINETUNED":
             text = prompt_params.get("text", "")
-            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+            
+            # Special handling for LLaMA models
+            if "LLAMA" in self.model_name:
+                # Format the input for LLaMA classification
+                emotion_labels_dict = get_emotion_labels(prompt_params.get("language", "nl"))
+                emotion_labels_list = list(emotion_labels_dict.values())
+                
+                # Format as an instruction for inference
+                formatted_text = f"Classify the emotion in this Dutch text into one of these categories: {', '.join(emotion_labels_list)}.\n\nText: {text}"
+                
+                # Tokenize with proper formatting for LLaMA
+                inputs = self.tokenizer(formatted_text, return_tensors="pt", truncation=True, max_length=512, padding="max_length")
+            else:
+                # Standard tokenization for other models
+                inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+                
             device = next(self.model.parameters()).device
             inputs = {k: v.to(device) for k, v in inputs.items()}
+            
             with torch.no_grad():
                 outputs = self.model(**inputs)
                 probs = outputs.logits.softmax(dim=-1)
-                return probs.argmax(dim=-1).item()
+                predicted_class = probs.argmax(dim=-1).item()
+                
+                # For debugging
+                if prompt_params.get("debug", False):
+                    print(f"Probabilities: {probs}")
+                    for i, p in enumerate(probs[0]):
+                        print(f"Class {i}: {p.item():.4f}")
+                
+                return predicted_class
 
         else:
             if self.family in ["MISTRAL", "GEMMA"]:

@@ -21,7 +21,7 @@ if args.few_k == 0:
 
 # llm_list = ["GPT-4o-mini"]
 translator = None
-llm_list = ["ROBBERT-EMOTION-FINETUNED", "QWEN-2.5-72B-GGUF", "LLAMA-3.3-70B-GGUF", "QWEN-2.5-14B-GGUF"]
+llm_list = ["LLAMA-1B-FINETUNED", "ROBBERT-V2-EMOTION-FINETUNED", "QWEN-2.5-72B-GGUF", "LLAMA-3.3-70B-GGUF", "QWEN-2.5-14B-GGUF"]
 
 if args.language == "nl":
     translator_model_name = "GPT-4o-mini"
@@ -69,7 +69,7 @@ for model_name in llm_list:
             continue
 
     if "FINETUNED" in model_name:
-        classifier = LLM(model_name)
+        classifier = LLM(model_name, model_params={"num_labels": 7, "ignore_mismatched_sizes": True})
     else:
         classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language))
 
@@ -98,7 +98,7 @@ for model_name in llm_list:
                 text = turn
             try:
                 if classifier.provider == "FINETUNED":
-                    pred = classifier.generate(prompt_params={"text": text})
+                    pred = classifier.generate(prompt_params={"text": text, "language": args.language})
                 else:
                     pred = classifier.generate(prompt_params={"text": text, "few_shot_examples": few_shot_examples})
                     pred = emotion_labels_inverse[pred]
