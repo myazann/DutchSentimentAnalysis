@@ -5,6 +5,9 @@ import os
 import sys
 import copy
 from datasets import load_dataset
+import torch
+from peft import PeftModel, PeftConfig
+from transformers import AutoModelForSequenceClassification, BitsAndBytesConfig
 
 from models import LLM
 from helpers import *
@@ -21,7 +24,7 @@ if args.few_k == 0:
 
 # llm_list = ["GPT-4o-mini"]
 translator = None
-llm_list = ["LLAMA-1B-FINETUNED", "ROBBERT-V2-EMOTION-FINETUNED", "QWEN-2.5-72B-GGUF", "LLAMA-3.3-70B-GGUF", "QWEN-2.5-14B-GGUF"]
+llm_list = ["LLAMA-1B-FINETUNED", "LLAMA-3B-FINETUNED", "ROBBERT-V2-EMOTION-FINETUNED", "QWEN-2.5-72B-GGUF", "LLAMA-3.3-70B-GGUF", "QWEN-2.5-14B-GGUF"]
 
 if args.language == "nl":
     translator_model_name = "GPT-4o-mini"
@@ -69,7 +72,61 @@ for model_name in llm_list:
             continue
 
     if "FINETUNED" in model_name:
-        classifier = LLM(model_name, model_params={"num_labels": 7, "ignore_mismatched_sizes": True})
+        if "ROBBERT" in model_name:
+            classifier = LLM(model_name, model_params={"num_labels": 7, "ignore_mismatched_sizes": True})
+        else:
+            # Check if this is a quantized model (models larger than 1B)
+            model_size_str = model_name.split("-")[-2]  # Get size part (e.g., "3B" from "LLAMA-3B-FINETUNED")
+            is_large_model = False
+            if model_size_str.endswith("B"):
+                try:
+                    model_size = float(model_size_str[:-1])
+                    is_large_model = model_size > 1.0
+                    print(f"Model size: {model_size}B, Using quantization: {is_large_model}")
+                except ValueError:
+                    # If we can't parse the size, assume it's not a large model
+                    pass
+            
+            if is_large_model and torch.cuda.is_available():
+                print(f"Loading quantized model with LoRA adapters: {model_name}")
+                # Initialize base LLM for tokenizer and config
+                base_model = LLM(model_name, default_prompt=get_classifier_prompt(args.language))
+                
+                # Setup quantization config
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+                
+                # Load the base model with quantization
+                base_model_path = base_model.repo_id
+                adapter_path = os.path.join("finetune", base_model_path.split("/")[-1], "final_model")
+                
+                # Load the quantized base model
+                quantized_model = AutoModelForSequenceClassification.from_pretrained(
+                    base_model_path,
+                    num_labels=7,
+                    quantization_config=quantization_config,
+                    device_map="auto",
+                    torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                )
+                
+                # Load the LoRA adapters
+                print(f"Loading adapters from: {adapter_path}")
+                classifier_model = PeftModel.from_pretrained(
+                    quantized_model,
+                    adapter_path,
+                    is_trainable=False  # Set to False for inference
+                )
+                
+                # Replace the model in the LLM instance
+                base_model.model = classifier_model
+                classifier = base_model
+            else:
+                # For smaller models, load normally
+                classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language), model_params={"num_labels": 7, "ignore_mismatched_sizes": True})
     else:
         classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language))
 

@@ -2,7 +2,7 @@ import argparse
 import os
 import json
 from datasets import load_dataset, Dataset, DatasetDict
-from transformers import TrainingArguments, Trainer
+from transformers import TrainingArguments, Trainer, AutoModelForSequenceClassification, BitsAndBytesConfig
 from transformers.integrations import WandbCallback, TensorBoardCallback
 from transformers.trainer_callback import EarlyStoppingCallback, TrainerCallback
 import logging
@@ -11,8 +11,10 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import wandb
 import torch
 from torch.utils.data import DataLoader
+import bitsandbytes as bnb  # Required for quantization
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 
-from helpers import get_emotion_labels, get_translate_prompt
+from helpers import get_emotion_labels, get_translate_prompt, get_classifier_prompt
 from models import LLM
 
 logging.basicConfig(
@@ -74,23 +76,28 @@ def prepare_data(dataset):
     return prepped_dataset
 
 def tokenize_function(model, examples):
-    # For LLaMA models, we need special handling
     if "LLAMA" in args.model:
-        # Add special tokens for better instruction tuning
-        emotion_labels_dict = get_emotion_labels(args.language)
-        emotion_labels_list = list(emotion_labels_dict.values())
-        texts = []
-        for text in examples['text']:
-            # Format as an instruction with context about the emotion classification task
-            prompt = f"<s>[INST] Classify the emotion in this Dutch text into one of these categories: {', '.join(emotion_labels_list)}.\n\nText: {text} [/INST]"
-            texts.append(prompt)
+        classifier_prompt = get_classifier_prompt(args.language)
         
-        # Use a shorter max_length for LLAMA models to reduce memory usage
+        # Process each text sample individually
+        formatted_prompts = []
+        for text in examples['text']:
+            # Format the prompt for this individual text sample
+            individual_prompt = model.format_prompt(classifier_prompt, {"text": text, "few_shot_examples": ""})
+            # Apply the chat template to the individual prompt
+            formatted_text = model.tokenizer.apply_chat_template(
+                individual_prompt, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            formatted_prompts.append(formatted_text)
+        
+        # Tokenize all formatted prompts
         return model.tokenizer(
-            texts, 
+            formatted_prompts, 
             padding="max_length", 
             truncation=True, 
-            max_length=256,  # Reduced from 384 to 256 to save memory
+            max_length=256, 
             return_tensors="pt"
         )
     else:
@@ -116,24 +123,17 @@ dataset = DatasetDict({
 
 num_labels = len(set(dataset["train"]["label"]))
 
-# Initialize the model with appropriate parameters for classification
 model_params = {
     "num_labels": num_labels,
     "ignore_mismatched_sizes": True
 }
 
-# For LLaMA models, we need to add a classification head
 if "LLAMA" in args.model:
     print(f"Using LLaMA model: {args.model}")
-    # Use AutoModelForSequenceClassification directly for LLaMA models
-    from transformers import AutoModelForSequenceClassification
-    import torch
     
-    # Check CUDA availability
     cuda_available = torch.cuda.is_available()
     if cuda_available:
         try:
-            # Try to free up CUDA memory
             torch.cuda.empty_cache()
             print("Using CUDA for training")
         except Exception as e:
@@ -143,10 +143,8 @@ if "LLAMA" in args.model:
     else:
         print("CUDA not available, using CPU")
     
-    # Initialize LLM just for the tokenizer
     model = LLM(args.model, model_params=model_params)
     
-    # Make sure the tokenizer has a padding token
     if model.tokenizer.pad_token is None:
         if model.tokenizer.eos_token is not None:
             model.tokenizer.pad_token = model.tokenizer.eos_token
@@ -157,22 +155,91 @@ if "LLAMA" in args.model:
     
     print(f"Padding token: {model.tokenizer.pad_token}, ID: {model.tokenizer.pad_token_id}")
     
-    # Then manually create the classification model with better initialization
+    # Check if model is larger than 1B and use quantization if it is
+    model_size_str = args.model.split("-")[-1]
+    is_large_model = False
+    if model_size_str.endswith("B"):
+        try:
+            model_size = float(model_size_str[:-1])
+            is_large_model = model_size > 1.0
+            print(f"Model size: {model_size}B, Using quantization: {is_large_model}")
+        except ValueError:
+            # If we can't parse the size, assume it's a large model
+            is_large_model = True
+            print("Could not determine model size, assuming large model and using quantization")
+    
+    # Configure quantization for large models
+    if is_large_model and cuda_available:
+        print("Using 4-bit quantization for large model")
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+    else:
+        quantization_config = None
+        print("Not using quantization")
+    
     try:
-        # First try loading with CUDA
+        # First try loading with CUDA and quantization if applicable
         classification_model = AutoModelForSequenceClassification.from_pretrained(
             model.repo_id,
             num_labels=num_labels,
             ignore_mismatched_sizes=True,
             problem_type="single_label_classification",
-            torch_dtype=torch.bfloat16 if (cuda_available and torch.cuda.is_bf16_supported()) else torch.float32,  # Use bfloat16 when possible
+            torch_dtype=torch.bfloat16 if (cuda_available and torch.cuda.is_bf16_supported()) else torch.float32,
+            quantization_config=quantization_config,
             low_cpu_mem_usage=True
         )
+        
+        # If using quantization, apply LoRA adapters
+        if is_large_model and cuda_available:
+            print("Applying LoRA adapters for quantized model")
+            # Prepare the model for k-bit training
+            classification_model = prepare_model_for_kbit_training(
+                classification_model,
+                use_gradient_checkpointing=True
+            )
+            
+            # Configure LoRA
+            lora_config = LoraConfig(
+                r=16,  # Rank dimension
+                lora_alpha=64,  # Alpha parameter for LoRA scaling
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                lora_dropout=0.05,
+                bias="none",
+                task_type=TaskType.SEQ_CLS
+            )
+            
+            # Apply LoRA adapters
+            classification_model = get_peft_model(classification_model, lora_config)
+            classification_model.print_trainable_parameters()
+        
+        # Set padding token in the model config
+        if classification_model.config.pad_token_id is None:
+            if model.tokenizer.pad_token_id is not None:
+                classification_model.config.pad_token_id = model.tokenizer.pad_token_id
+            else:
+                # Use EOS token as padding token if no padding token is defined
+                classification_model.config.pad_token_id = classification_model.config.eos_token_id
+        
+        if hasattr(classification_model, "classifier"):
+            classification_model.classifier.weight.data.normal_(mean=0.0, std=0.02)
+            classification_model.classifier.bias.data.zero_()
+            print("Initialized classification head with better weights")
+        
+        # Replace the model's internal model with our classification model
+        model.model = classification_model
+        
+        # Resize embeddings if needed
+        if hasattr(model.model, "resize_token_embeddings") and model.tokenizer is not None:
+            model.model.resize_token_embeddings(len(model.tokenizer))
     except RuntimeError as e:
         if "CUDA" in str(e):
             print(f"CUDA error: {e}")
             print("Falling back to CPU for model loading")
-            # Try loading on CPU
+            # Try loading on CPU without quantization (quantization requires CUDA)
             classification_model = AutoModelForSequenceClassification.from_pretrained(
                 model.repo_id,
                 num_labels=num_labels,
@@ -183,28 +250,6 @@ if "LLAMA" in args.model:
             )
         else:
             raise e
-    
-    # Set padding token in the model config
-    if classification_model.config.pad_token_id is None:
-        if model.tokenizer.pad_token_id is not None:
-            classification_model.config.pad_token_id = model.tokenizer.pad_token_id
-        else:
-            # Use EOS token as padding token if no padding token is defined
-            classification_model.config.pad_token_id = classification_model.config.eos_token_id
-    
-    # Initialize classification head with better weights for stable training
-    if hasattr(classification_model, "classifier"):
-        # Initialize the classification head with small values
-        classification_model.classifier.weight.data.normal_(mean=0.0, std=0.02)
-        classification_model.classifier.bias.data.zero_()
-        print("Initialized classification head with better weights")
-    
-    # Replace the model's internal model with our classification model
-    model.model = classification_model
-    
-    # Resize embeddings if needed
-    if hasattr(model.model, "resize_token_embeddings") and model.tokenizer is not None:
-        model.model.resize_token_embeddings(len(model.tokenizer))
 else:
     model = LLM(args.model, model_params=model_params)
 
@@ -214,7 +259,6 @@ logger.info(f"Number of unique labels in dataset: {num_labels}")
 cache_dir = os.path.join("cache", args.model.replace("/", "_"))
 os.makedirs(cache_dir, exist_ok=True)
 
-# Skip using cache due to PyTorch 2.6 compatibility issues
 logger.info("Tokenizing datasets (this may take a while)...")
 # Use more workers for faster processing
 num_proc = min(os.cpu_count() // 2, 4)  # Use half of available CPUs but max 4
@@ -238,6 +282,7 @@ except Exception as e:
     logger.warning(f"Failed to save tokenized datasets to cache: {e}")
     logger.info("Continuing without saving cache...")
 
+gradient_accumulation_steps = gradient_accumulation_steps//4 if is_large_model else gradient_accumulation_steps
 wandb_name = args.wandb_name if args.wandb_name else f"{args.model.split('/')[-1]}-{args.language}-emotion"
 wandb.init(
     project=args.wandb_project,
@@ -260,9 +305,13 @@ num_train_samples = len(tokenized_datasets["train"])
 
 # Determine optimal batch size based on model
 if "LLAMA" in args.model:
-    batch_size = 8  # Slightly larger batch size for LLaMA
+    # Check if we're using quantization to determine batch size
+    if is_large_model and cuda_available:
+        batch_size = 128  # Can use larger batch size with quantization
+    else:
+        batch_size = 16  # Smaller batch size for non-quantized models
 else:
-    batch_size = 32
+    batch_size = 64
 
 total_train_steps = (num_train_samples // (batch_size * gradient_accumulation_steps)) * num_epochs
 warmup_steps = int(total_train_steps * warmup_ratio)
@@ -286,23 +335,23 @@ training_args = TrainingArguments(
     save_strategy="steps",
     save_steps=500,
     save_total_limit=3,
-    fp16=False,  # Disable fp16 to avoid gradient scaling issues
-    bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),  # Use bf16 if available as it's more stable
+    fp16=False, 
+    bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported() and not (is_large_model and cuda_available),  # Don't use bf16 with 4-bit quantization
     logging_steps=100,  
     report_to="wandb",
     warmup_steps=warmup_steps,
     gradient_accumulation_steps=gradient_accumulation_steps,
     max_grad_norm=max_grad_norm,
     gradient_checkpointing=True if "LLAMA" in args.model else False,
-    lr_scheduler_type="cosine",  # Use cosine scheduler for better convergence
-    dataloader_num_workers=num_proc,  # Use multiple workers for data loading
-    dataloader_pin_memory=True,  # Pin memory for faster data transfer to GPU
-    optim="adamw_torch",  # Use torch implementation for better performance
-    run_name=f"{args.model.split('/')[-1]}-{args.language}-emotion-{wandb_name}",  # Add a unique run name
+    lr_scheduler_type="cosine",  
+    dataloader_num_workers=num_proc,  
+    dataloader_pin_memory=True,  
+    optim="paged_adamw_8bit" if (is_large_model and cuda_available) else "adamw_torch",  # Use 8-bit optimizer with quantization
+    run_name=f"{args.model.split('/')[-1]}-{args.language}-emotion-{wandb_name}",  
 )
 
 # Ensure the output directory exists
-os.makedirs(model.finetune_path, exist_ok=True)
+os.makedirs(training_args.output_dir, exist_ok=True)
 
 # Create a custom callback to log learning rate
 class LearningRateLoggerCallback(TrainerCallback):
@@ -340,7 +389,22 @@ class CheckpointSafetyCallback(TrainerCallback):
 
 # Create a custom data collator that handles padding efficiently
 from transformers import DataCollatorWithPadding
-data_collator = DataCollatorWithPadding(tokenizer=model.tokenizer, padding="longest")
+
+# Create appropriate data collator based on whether we're using quantization
+if "LLAMA" in args.model and is_large_model and cuda_available:
+    print("Using DataCollatorWithPadding with 4-bit quantization compatibility")
+    # For quantized models, we need to ensure we don't convert tensors to float16/bfloat16
+    # as this would break the quantization
+    data_collator = DataCollatorWithPadding(
+        tokenizer=model.tokenizer, 
+        padding="longest",
+        return_tensors="pt"
+    )
+else:
+    data_collator = DataCollatorWithPadding(
+        tokenizer=model.tokenizer, 
+        padding="longest"
+    )
 
 trainer = Trainer(
     model=model.model,
@@ -369,7 +433,17 @@ try:
     # Save the final model
     final_model_path = os.path.join(model.finetune_path, "final_model")
     os.makedirs(final_model_path, exist_ok=True)
-    trainer.save_model(final_model_path)
+    
+    # For quantized models with LoRA, save adapters separately
+    if "LLAMA" in args.model and is_large_model and cuda_available:
+        logger.info("Saving LoRA adapters for quantized model...")
+        # Save only the LoRA adapters
+        model.model.save_pretrained(final_model_path)
+    else:
+        # Save the full model for non-quantized models
+        trainer.save_model(final_model_path)
+    
+    # Always save the tokenizer
     model.tokenizer.save_pretrained(final_model_path)
     
 except FileNotFoundError as e:

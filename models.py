@@ -33,7 +33,7 @@ class LLM:
         self.repo_id = self.cfg.get("repo_id")
         self.file_name = self.cfg.get("file_name", None)
         self.context_length = int(self.cfg.get("context_length"))
-        self.finetune_path = os.path.join("finetune", self.repo_id.split("/")[-1])
+        self.finetune_path = os.path.join("finetune", self.repo_id.split("/")[-1], "final_model")
         self.provider = self.get_provider()
         self.tokenizer = self.init_tokenizer()
         self.model_params = self.get_model_params(model_params)
@@ -175,21 +175,72 @@ class LLM:
                 model_path = f"{model_path}/{self.file_name}-00001-of-0000{len_files}.gguf"
             return Llama(model_path=model_path, **self.model_params)
         elif self.provider == "FINETUNED":
-            model_path = os.path.join(self.finetune_path, "final_model")
-            if os.path.exists(model_path):
+            if os.path.exists(self.finetune_path):
                 # Check if this is a LLaMA model
                 if "LLAMA" in self.model_name:
-                    print(f"Loading fine-tuned LLaMA model from {model_path}")
-                    # For LLaMA models, we need to use AutoModelForSequenceClassification
+                    print(f"Loading fine-tuned LLaMA model from {self.finetune_path}")
                     
-                    model = AutoModelForSequenceClassification.from_pretrained(
-                        model_path, 
-                        **self.model_params,
-                        torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32,
-                        low_cpu_mem_usage=True
-                    )
+                    # Check if this is a large model (>1B parameters) that might be quantized
+                    model_size_str = self.model_name.split("-")[-2]  # Get size part (e.g., "3B" from "LLAMA-3B-FINETUNED")
+                    is_large_model = False
+                    if model_size_str.endswith("B"):
+                        try:
+                            model_size = float(model_size_str[:-1])
+                            is_large_model = model_size > 1.0
+                            print(f"Model size: {model_size}B, Using quantization: {is_large_model}")
+                        except ValueError:
+                            # If we can't parse the size, assume it's not a large model
+                            pass
+                    
+                    # For large models, check if we need to load with quantization
+                    if is_large_model and torch.cuda.is_available():
+                        # Check if this is a LoRA adapter (look for adapter_config.json)
+                        adapter_config_path = os.path.join(self.finetune_path, "adapter_config.json")
+                        if os.path.exists(adapter_config_path):
+                            print(f"Loading quantized model with LoRA adapters from {self.finetune_path}")
+                            from peft import PeftModel, PeftConfig
+                            
+                            # Setup quantization config
+                            quantization_config = BitsAndBytesConfig(
+                                load_in_4bit=True,
+                                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                                bnb_4bit_use_double_quant=True,
+                                bnb_4bit_quant_type="nf4",
+                            )
+                            
+                            # Load the quantized base model
+                            quantized_model = AutoModelForSequenceClassification.from_pretrained(
+                                self.repo_id,
+                                num_labels=7,
+                                quantization_config=quantization_config,
+                                device_map="auto",
+                                torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                            )
+                            
+                            # Load the LoRA adapters
+                            model = PeftModel.from_pretrained(
+                                quantized_model,
+                                self.finetune_path,
+                                is_trainable=False  # Set to False for inference
+                            )
+                        else:
+                            # Regular model (not LoRA)
+                            model = AutoModelForSequenceClassification.from_pretrained(
+                                self.finetune_path, 
+                                **self.model_params,
+                                torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32,
+                                low_cpu_mem_usage=True
+                            )
+                    else:
+                        # For smaller models, load normally
+                        model = AutoModelForSequenceClassification.from_pretrained(
+                            self.finetune_path, 
+                            **self.model_params,
+                            torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32,
+                            low_cpu_mem_usage=True
+                        )
                 else:
-                    model = AutoModelForSequenceClassification.from_pretrained(model_path, **self.model_params)
+                    model = AutoModelForSequenceClassification.from_pretrained(self.finetune_path, **self.model_params)
             else:
                 print("Couldn't find the finetuned model, initializing with the original model")
                 # Special handling for LLaMA models for classification
@@ -391,24 +442,9 @@ class LLM:
             )
             output = response.text 
 
-        elif self.provider == "FINETUNED":
+        elif self.provider == "FINETUNED" and "instruct" not in self.repo_id:
             text = prompt_params.get("text", "")
-            
-            # Special handling for LLaMA models
-            if "LLAMA" in self.model_name:
-                # Format the input for LLaMA classification
-                emotion_labels_dict = get_emotion_labels(prompt_params.get("language", "nl"))
-                emotion_labels_list = list(emotion_labels_dict.values())
-                
-                # Format as an instruction for inference
-                formatted_text = f"Classify the emotion in this Dutch text into one of these categories: {', '.join(emotion_labels_list)}.\n\nText: {text}"
-                
-                # Tokenize with proper formatting for LLaMA
-                inputs = self.tokenizer(formatted_text, return_tensors="pt", truncation=True, max_length=512, padding="max_length")
-            else:
-                # Standard tokenization for other models
-                inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-                
+            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
             device = next(self.model.parameters()).device
             inputs = {k: v.to(device) for k, v in inputs.items()}
             
@@ -417,13 +453,7 @@ class LLM:
                 probs = outputs.logits.softmax(dim=-1)
                 predicted_class = probs.argmax(dim=-1).item()
                 
-                # For debugging
-                if prompt_params.get("debug", False):
-                    print(f"Probabilities: {probs}")
-                    for i, p in enumerate(probs[0]):
-                        print(f"Class {i}: {p.item():.4f}")
-                
-                return predicted_class
+                output = predicted_class
 
         else:
             if self.family in ["MISTRAL", "GEMMA"]:
@@ -435,13 +465,10 @@ class LLM:
             else:
                 if stream:
                     return self.stream_hf_output(prompt, gen_params)
-                else:
-                    streamer = None
-                pipe = pipeline("text-generation", model=self.model, tokenizer=self.tokenizer, streamer=streamer, **gen_params)
+                pipe = pipeline("text-generation", model=self.model, tokenizer=self.tokenizer, **gen_params)
                 output = pipe(prompt)[0]["generated_text"][-1]["content"]
 
         return output
-
     
     async def stream_hf_output(self, prompt, gen_params):
 
