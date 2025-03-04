@@ -33,7 +33,7 @@ class LLM:
         self.repo_id = self.cfg.get("repo_id")
         self.file_name = self.cfg.get("file_name", None)
         self.context_length = int(self.cfg.get("context_length"))
-        self.finetune_path = os.path.join("finetune", self.repo_id.split("/")[-1], "final_model")
+        self.finetune_path = os.path.join("finetune", self.repo_id.split("/")[-1])
         self.provider = self.get_provider()
         self.tokenizer = self.init_tokenizer()
         self.model_params = self.get_model_params(model_params)
@@ -175,12 +175,10 @@ class LLM:
                 model_path = f"{model_path}/{self.file_name}-00001-of-0000{len_files}.gguf"
             return Llama(model_path=model_path, **self.model_params)
         elif self.provider == "FINETUNED":
-            if os.path.exists(self.finetune_path):
+            final_path = os.path.join(self.finetune_path, "final_model")
+            if os.path.exists(final_path):
                 # Check if this is a LLaMA model
-                if "LLAMA" in self.model_name:
-                    print(f"Loading fine-tuned LLaMA model from {self.finetune_path}")
-                    
-                    # Check if this is a large model (>1B parameters) that might be quantized
+                if "LLAMA" in self.model_name:                    
                     model_size_str = self.model_name.split("-")[-2]  # Get size part (e.g., "3B" from "LLAMA-3B-FINETUNED")
                     is_large_model = False
                     if model_size_str.endswith("B"):
@@ -192,15 +190,14 @@ class LLM:
                             # If we can't parse the size, assume it's not a large model
                             pass
                     
-                    # For large models, check if we need to load with quantization
-                    if is_large_model and torch.cuda.is_available():
-                        # Check if this is a LoRA adapter (look for adapter_config.json)
-                        adapter_config_path = os.path.join(self.finetune_path, "adapter_config.json")
-                        if os.path.exists(adapter_config_path):
-                            print(f"Loading quantized model with LoRA adapters from {self.finetune_path}")
-                            from peft import PeftModel, PeftConfig
-                            
-                            # Setup quantization config
+                    # Check if this is a LoRA adapter by looking for adapter_config.json
+                    adapter_config_path = os.path.join(final_path, "adapter_config.json")
+                    is_lora_adapter = os.path.exists(adapter_config_path)
+                    
+                    if is_lora_adapter:
+                        print(f"Detected LoRA adapter at {adapter_config_path}")
+
+                        if is_large_model and torch.cuda.is_available():
                             quantization_config = BitsAndBytesConfig(
                                 load_in_4bit=True,
                                 bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
@@ -208,39 +205,53 @@ class LLM:
                                 bnb_4bit_quant_type="nf4",
                             )
                             
-                            # Load the quantized base model
-                            quantized_model = AutoModelForSequenceClassification.from_pretrained(
+                            base_model = AutoModelForSequenceClassification.from_pretrained(
                                 self.repo_id,
                                 num_labels=7,
                                 quantization_config=quantization_config,
                                 device_map="auto",
                                 torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
                             )
+                        else:
+                            base_model = AutoModelForSequenceClassification.from_pretrained(
+                                self.repo_id,
+                                num_labels=7,
+                                **self.model_params
+                            )
+                        
+                        model = PeftModel.from_pretrained(
+                            base_model,
+                            final_path,
+                            is_trainable=False 
+                        )
+                    else:
+                        # For regular fine-tuned models (not LoRA adapters)
+                        if is_large_model and torch.cuda.is_available():
+                            # For larger models, check if we need to load with quantization
+                            quantization_config = BitsAndBytesConfig(
+                                load_in_4bit=True,
+                                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                                bnb_4bit_use_double_quant=True,
+                                bnb_4bit_quant_type="nf4",
+                            )
                             
-                            # Load the LoRA adapters
-                            model = PeftModel.from_pretrained(
-                                quantized_model,
-                                self.finetune_path,
-                                is_trainable=False  # Set to False for inference
+                            model = AutoModelForSequenceClassification.from_pretrained(
+                                final_path, 
+                                **self.model_params,
+                                quantization_config=quantization_config,
+                                device_map="auto",
+                                torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
                             )
                         else:
-                            # Regular model (not LoRA)
+                            # For smaller models, load normally
                             model = AutoModelForSequenceClassification.from_pretrained(
-                                self.finetune_path, 
+                                final_path, 
                                 **self.model_params,
                                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32,
                                 low_cpu_mem_usage=True
                             )
-                    else:
-                        # For smaller models, load normally
-                        model = AutoModelForSequenceClassification.from_pretrained(
-                            self.finetune_path, 
-                            **self.model_params,
-                            torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32,
-                            low_cpu_mem_usage=True
-                        )
                 else:
-                    model = AutoModelForSequenceClassification.from_pretrained(self.finetune_path, **self.model_params)
+                    model = AutoModelForSequenceClassification.from_pretrained(final_path, **self.model_params)
             else:
                 print("Couldn't find the finetuned model, initializing with the original model")
                 # Special handling for LLaMA models for classification

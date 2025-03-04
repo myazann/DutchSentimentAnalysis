@@ -1,8 +1,9 @@
 import argparse
 import os
 import json
+import subprocess
 from datasets import load_dataset, Dataset, DatasetDict
-from transformers import TrainingArguments, Trainer, AutoModelForSequenceClassification, BitsAndBytesConfig
+from transformers import TrainingArguments, Trainer, AutoModelForSequenceClassification, BitsAndBytesConfig, DataCollatorWithPadding
 from transformers.integrations import WandbCallback, TensorBoardCallback
 from transformers.trainer_callback import EarlyStoppingCallback, TrainerCallback
 import logging
@@ -76,7 +77,7 @@ def prepare_data(dataset):
     return prepped_dataset
 
 def tokenize_function(model, examples):
-    if "LLAMA" in args.model:
+    if "LLAMA" in args.model or "FIETJE" in args.model:
         classifier_prompt = get_classifier_prompt(args.language)
         
         # Process each text sample individually
@@ -128,21 +129,8 @@ model_params = {
     "ignore_mismatched_sizes": True
 }
 
-if "LLAMA" in args.model:
-    print(f"Using LLaMA model: {args.model}")
-    
+if "LLAMA" in args.model or "FIETJE" in args.model:
     cuda_available = torch.cuda.is_available()
-    if cuda_available:
-        try:
-            torch.cuda.empty_cache()
-            print("Using CUDA for training")
-        except Exception as e:
-            print(f"CUDA error: {e}")
-            print("Falling back to CPU")
-            cuda_available = False
-    else:
-        print("CUDA not available, using CPU")
-    
     model = LLM(args.model, model_params=model_params)
     
     if model.tokenizer.pad_token is None:
@@ -155,20 +143,22 @@ if "LLAMA" in args.model:
     
     print(f"Padding token: {model.tokenizer.pad_token}, ID: {model.tokenizer.pad_token_id}")
     
-    # Check if model is larger than 1B and use quantization if it is
-    model_size_str = args.model.split("-")[-1]
+    # Check if model requires quantization based on min_GPU_RAM from config
     is_large_model = False
-    if model_size_str.endswith("B"):
-        try:
-            model_size = float(model_size_str[:-1])
-            is_large_model = model_size > 1.0
-            print(f"Model size: {model_size}B, Using quantization: {is_large_model}")
-        except ValueError:
-            # If we can't parse the size, assume it's a large model
-            is_large_model = True
-            print("Could not determine model size, assuming large model and using quantization")
+    model_cfg = LLM.get_cfg()[args.model]
+    min_gpu_ram = model_cfg.get("min_GPU_RAM")
     
-    # Configure quantization for large models
+    if min_gpu_ram is not None:
+        try:
+            min_gpu_ram = int(min_gpu_ram)
+            is_large_model = min_gpu_ram >= 10
+            print(f"Model min_GPU_RAM: {min_gpu_ram}GB, Using quantization: {is_large_model}")
+        except (ValueError, TypeError):
+            is_large_model = False
+            print("Could not determine min_GPU_RAM, not using quantization")
+    else:
+        print("No min_GPU_RAM specified in config, not using quantization")
+    
     if is_large_model and cuda_available:
         print("Using 4-bit quantization for large model")
         quantization_config = BitsAndBytesConfig(
@@ -183,6 +173,7 @@ if "LLAMA" in args.model:
     
     try:
         # First try loading with CUDA and quantization if applicable
+        print(f"Loading model from {model.repo_id}")
         classification_model = AutoModelForSequenceClassification.from_pretrained(
             model.repo_id,
             num_labels=num_labels,
@@ -190,7 +181,8 @@ if "LLAMA" in args.model:
             problem_type="single_label_classification",
             torch_dtype=torch.bfloat16 if (cuda_available and torch.cuda.is_bf16_supported()) else torch.float32,
             quantization_config=quantization_config,
-            low_cpu_mem_usage=True
+            low_cpu_mem_usage=True,
+            device_map="auto" if cuda_available else None  # Explicitly use device_map="auto" for GPU
         )
         
         # If using quantization, apply LoRA adapters
@@ -215,6 +207,14 @@ if "LLAMA" in args.model:
             # Apply LoRA adapters
             classification_model = get_peft_model(classification_model, lora_config)
             classification_model.print_trainable_parameters()
+            
+            # Explicitly move model to GPU and verify device
+            if cuda_available:
+                device = torch.device("cuda")
+                classification_model = classification_model.to(device)
+                # Check if model is actually on GPU
+                print(f"Model device check - Is model on CUDA: {next(classification_model.parameters()).is_cuda}")
+                print(f"Model device: {next(classification_model.parameters()).device}")
         
         # Set padding token in the model config
         if classification_model.config.pad_token_id is None:
@@ -260,7 +260,6 @@ cache_dir = os.path.join("cache", args.model.replace("/", "_"))
 os.makedirs(cache_dir, exist_ok=True)
 
 logger.info("Tokenizing datasets (this may take a while)...")
-# Use more workers for faster processing
 num_proc = min(os.cpu_count() // 2, 4)  # Use half of available CPUs but max 4
 tokenized_datasets = dataset.map(
     lambda examples: tokenize_function(model, examples), 
@@ -282,7 +281,6 @@ except Exception as e:
     logger.warning(f"Failed to save tokenized datasets to cache: {e}")
     logger.info("Continuing without saving cache...")
 
-gradient_accumulation_steps = gradient_accumulation_steps//4 if is_large_model else gradient_accumulation_steps
 wandb_name = args.wandb_name if args.wandb_name else f"{args.model.split('/')[-1]}-{args.language}-emotion"
 wandb.init(
     project=args.wandb_project,
@@ -304,12 +302,12 @@ wandb.init(
 num_train_samples = len(tokenized_datasets["train"])
 
 # Determine optimal batch size based on model
-if "LLAMA" in args.model:
+if "LLAMA" in args.model or "FIETJE" in args.model:
     # Check if we're using quantization to determine batch size
     if is_large_model and cuda_available:
-        batch_size = 128  # Can use larger batch size with quantization
+        batch_size = 128 
     else:
-        batch_size = 16  # Smaller batch size for non-quantized models
+        batch_size = 16
 else:
     batch_size = 64
 
@@ -335,19 +333,24 @@ training_args = TrainingArguments(
     save_strategy="steps",
     save_steps=500,
     save_total_limit=3,
-    fp16=False, 
+    fp16=is_large_model and cuda_available,  # Enable fp16 for quantized models
     bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported() and not (is_large_model and cuda_available),  # Don't use bf16 with 4-bit quantization
     logging_steps=100,  
     report_to="wandb",
     warmup_steps=warmup_steps,
     gradient_accumulation_steps=gradient_accumulation_steps,
     max_grad_norm=max_grad_norm,
-    gradient_checkpointing=True if "LLAMA" in args.model else False,
+    gradient_checkpointing=True if "LLAMA" in args.model or "FIETJE" in args.model else False,
     lr_scheduler_type="cosine",  
     dataloader_num_workers=num_proc,  
     dataloader_pin_memory=True,  
     optim="paged_adamw_8bit" if (is_large_model and cuda_available) else "adamw_torch",  # Use 8-bit optimizer with quantization
-    run_name=f"{args.model.split('/')[-1]}-{args.language}-emotion-{wandb_name}",  
+    run_name=f"{args.model.split('/')[-1]}-{args.language}-emotion-{wandb_name}",
+    no_cuda=False,
+    ddp_find_unused_parameters=False, 
+    group_by_length=True,  
+    length_column_name="length",  
+    remove_unused_columns=True,  
 )
 
 # Ensure the output directory exists
@@ -367,11 +370,28 @@ class GPUStatsCallback(TrainerCallback):
         if torch.cuda.is_available() and state.is_local_process_zero:
             memory_allocated = torch.cuda.memory_allocated() / (1024 ** 3)  # Convert to GB
             memory_reserved = torch.cuda.memory_reserved() / (1024 ** 3)  # Convert to GB
+            gpu_utilization = 0
+            
+            # Try to get GPU utilization from nvidia-smi
+            try:
+                nvidia_smi_output = subprocess.check_output(
+                    "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits", 
+                    shell=True
+                ).decode().strip()
+                gpu_utilization = float(nvidia_smi_output)
+            except:
+                pass
+                
             # Use the exact global step for logging
             wandb.log({
                 "gpu_memory_allocated_gb": memory_allocated,
-                "gpu_memory_reserved_gb": memory_reserved
+                "gpu_memory_reserved_gb": memory_reserved,
+                "gpu_utilization": gpu_utilization
             }, step=state.global_step)
+            
+            # Print GPU stats to console
+            print(f"Step {state.global_step}: GPU Memory: {memory_allocated:.2f}GB allocated, "
+                  f"{memory_reserved:.2f}GB reserved, Utilization: {gpu_utilization}%")
 
 # Add a custom callback to handle missing checkpoint directories
 class CheckpointSafetyCallback(TrainerCallback):
@@ -388,10 +408,9 @@ class CheckpointSafetyCallback(TrainerCallback):
         return control
 
 # Create a custom data collator that handles padding efficiently
-from transformers import DataCollatorWithPadding
 
 # Create appropriate data collator based on whether we're using quantization
-if "LLAMA" in args.model and is_large_model and cuda_available:
+if ("LLAMA" in args.model or "FIETJE" in args.model) and is_large_model and cuda_available:
     print("Using DataCollatorWithPadding with 4-bit quantization compatibility")
     # For quantized models, we need to ensure we don't convert tensors to float16/bfloat16
     # as this would break the quantization
@@ -435,7 +454,7 @@ try:
     os.makedirs(final_model_path, exist_ok=True)
     
     # For quantized models with LoRA, save adapters separately
-    if "LLAMA" in args.model and is_large_model and cuda_available:
+    if ("LLAMA" in args.model or "FIETJE" in args.model) and is_large_model and cuda_available:
         logger.info("Saving LoRA adapters for quantized model...")
         # Save only the LoRA adapters
         model.model.save_pretrained(final_model_path)

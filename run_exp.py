@@ -24,7 +24,7 @@ if args.few_k == 0:
 
 # llm_list = ["GPT-4o-mini"]
 translator = None
-llm_list = ["LLAMA-1B-FINETUNED", "LLAMA-3B-FINETUNED", "ROBBERT-V2-EMOTION-FINETUNED", "QWEN-2.5-72B-GGUF", "LLAMA-3.3-70B-GGUF", "QWEN-2.5-14B-GGUF"]
+llm_list = ["LLAMA-3B-FINETUNED", "FIETJE-2-CHAT-FINETUNED", "LLAMA-1B-FINETUNED", "ROBBERT-V2-EMOTION-FINETUNED", "QWEN-2.5-72B-GGUF", "LLAMA-3.3-70B-GGUF", "QWEN-2.5-14B-GGUF"]
 
 if args.language == "nl":
     translator_model_name = "GPT-4o-mini"
@@ -75,55 +75,66 @@ for model_name in llm_list:
         if "ROBBERT" in model_name:
             classifier = LLM(model_name, model_params={"num_labels": 7, "ignore_mismatched_sizes": True})
         else:
-            # Check if this is a quantized model (models larger than 1B)
-            model_size_str = model_name.split("-")[-2]  # Get size part (e.g., "3B" from "LLAMA-3B-FINETUNED")
             is_large_model = False
-            if model_size_str.endswith("B"):
-                try:
-                    model_size = float(model_size_str[:-1])
-                    is_large_model = model_size > 1.0
-                    print(f"Model size: {model_size}B, Using quantization: {is_large_model}")
-                except ValueError:
-                    # If we can't parse the size, assume it's not a large model
-                    pass
+            
+            try:
+                model_cfg = LLM.get_cfg()[model_name]
+                min_gpu_ram = model_cfg.get("min_GPU_RAM")
+                
+                if min_gpu_ram is not None:
+                    try:
+                        min_gpu_ram = int(min_gpu_ram)
+                        is_large_model = min_gpu_ram >= 10
+                        print(f"Model min_GPU_RAM: {min_gpu_ram}GB, Using quantization: {is_large_model}")
+                    except (ValueError, TypeError):
+                        is_large_model = False
+                        print("Could not determine min_GPU_RAM, not using quantization")
+                else:
+                    print("No min_GPU_RAM specified in config, not using quantization")
+            except KeyError:
+                print(f"Model {model_name} not found in config, not using quantization")
+                is_large_model = False
             
             if is_large_model and torch.cuda.is_available():
-                print(f"Loading quantized model with LoRA adapters: {model_name}")
-                # Initialize base LLM for tokenizer and config
                 base_model = LLM(model_name, default_prompt=get_classifier_prompt(args.language))
-                
-                # Setup quantization config
-                quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                )
-                
-                # Load the base model with quantization
-                base_model_path = base_model.repo_id
-                adapter_path = os.path.join("finetune", base_model_path.split("/")[-1], "final_model")
-                
-                # Load the quantized base model
-                quantized_model = AutoModelForSequenceClassification.from_pretrained(
-                    base_model_path,
-                    num_labels=7,
-                    quantization_config=quantization_config,
-                    device_map="auto",
-                    torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-                )
-                
-                # Load the LoRA adapters
-                print(f"Loading adapters from: {adapter_path}")
-                classifier_model = PeftModel.from_pretrained(
-                    quantized_model,
-                    adapter_path,
-                    is_trainable=False  # Set to False for inference
-                )
-                
-                # Replace the model in the LLM instance
-                base_model.model = classifier_model
-                classifier = base_model
+
+                # Check if the model is a LoRA adapter by looking for adapter_config.json
+                finetune_path = os.path.join("finetune", base_model.repo_id.split("/")[-1], "final_model")
+                adapter_config_path = os.path.join(finetune_path, "final_model", "adapter_config.json")
+                is_lora_adapter = os.path.exists(adapter_config_path)
+
+                if is_lora_adapter:
+                    print(f"Loading as LoRA adapter: {model_name}")
+                    # Setup quantization config
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4",
+                    )
+                    
+                    # Load the quantized base model
+                    quantized_model = AutoModelForSequenceClassification.from_pretrained(
+                        base_model.repo_id,
+                        num_labels=7,
+                        quantization_config=quantization_config,
+                        device_map="auto",
+                        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                    )
+                    
+                    # Load the LoRA adapters
+                    classifier_model = PeftModel.from_pretrained(
+                        quantized_model,
+                        os.path.join(finetune_path, "final_model"),
+                        is_trainable=False  # Set to False for inference
+                    )
+                    
+                    # Replace the model in the LLM instance
+                    base_model.model = classifier_model
+                    classifier = base_model
+                else:
+                    # Regular model loading
+                    classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language), model_params={"num_labels": 7, "ignore_mismatched_sizes": True})
             else:
                 # For smaller models, load normally
                 classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language), model_params={"num_labels": 7, "ignore_mismatched_sizes": True})
