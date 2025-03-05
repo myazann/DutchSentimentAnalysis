@@ -113,7 +113,6 @@ for model_name in llm_list:
                         bnb_4bit_quant_type="nf4",
                     )
                     
-                    # Load the quantized base model
                     quantized_model = AutoModelForSequenceClassification.from_pretrained(
                         base_model.repo_id,
                         num_labels=7,
@@ -122,21 +121,17 @@ for model_name in llm_list:
                         torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
                     )
                     
-                    # Load the LoRA adapters
                     classifier_model = PeftModel.from_pretrained(
                         quantized_model,
                         os.path.join(finetune_path, "final_model"),
                         is_trainable=False  # Set to False for inference
                     )
                     
-                    # Replace the model in the LLM instance
                     base_model.model = classifier_model
                     classifier = base_model
                 else:
-                    # Regular model loading
                     classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language), model_params={"num_labels": 7, "ignore_mismatched_sizes": True})
             else:
-                # For smaller models, load normally
                 classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language), model_params={"num_labels": 7, "ignore_mismatched_sizes": True})
     else:
         classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language))

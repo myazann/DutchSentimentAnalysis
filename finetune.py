@@ -12,7 +12,6 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import wandb
 import torch
 from torch.utils.data import DataLoader
-import bitsandbytes as bnb  # Required for quantization
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 
 from helpers import get_emotion_labels, get_translate_prompt, get_classifier_prompt
@@ -31,7 +30,7 @@ parser.add_argument("--wandb_project", default="dutch-sentiment", type=str)
 parser.add_argument("-wn", "--wandb_name", default="robbert-emotion", type=str)
 args = parser.parse_args()
 
-learning_rate = 2e-5
+learning_rate = 1e-5
 weight_decay = 0.01
 warmup_ratio = 0.1
 num_epochs = 5
@@ -66,7 +65,6 @@ def prepare_data(dataset):
                     translated_text = stored_translations[split][text]
                 else:
                     print("Couldn't find translation!")
-                    print(text)
                     translated_text = translator.generate(prompt_params={"text": text})
                     stored_translations[split][text] = translated_text
                 
@@ -264,8 +262,8 @@ num_proc = min(os.cpu_count() // 2, 4)  # Use half of available CPUs but max 4
 tokenized_datasets = dataset.map(
     lambda examples: tokenize_function(model, examples), 
     batched=True,
-    batch_size=1024,  # Larger batch size for efficiency
-    num_proc=num_proc,  # Parallel processing
+    batch_size=1024,  
+    num_proc=num_proc,  
     desc="Tokenizing datasets"
 )
 tokenized_datasets = tokenized_datasets.remove_columns(["text"])
