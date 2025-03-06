@@ -26,11 +26,11 @@ logger = logging.getLogger(__name__)
 parser = argparse.ArgumentParser()
 parser.add_argument("-m", "--model", default="ROBBERT-V2-EMOTION-FINETUNED", type=str)
 parser.add_argument("-lg", "--language", default="nl", type=str)
-parser.add_argument("--wandb_project", default="dutch-sentiment", type=str)
+parser.add_argument("-wp", "--wandb_project", default="dutch-sentiment", type=str)
 parser.add_argument("-wn", "--wandb_name", default="robbert-emotion", type=str)
 args = parser.parse_args()
 
-learning_rate = 1e-5
+learning_rate = 2e-5
 weight_decay = 0.01
 warmup_ratio = 0.1
 num_epochs = 5
@@ -61,15 +61,16 @@ def prepare_data(dataset):
             for j in range(len(dialogs[i])):
 
                 text = dialogs[i][j]
-                if stored_translations[split].get(text, None) is not None:
-                    translated_text = stored_translations[split][text]
-                else:
-                    print("Couldn't find translation!")
-                    translated_text = translator.generate(prompt_params={"text": text})
+                if args.language == "nl":
+                    if stored_translations[split].get(text, None) is not None:
+                        text = stored_translations[split][text]
+                    else:
+                        print("Couldn't find translation!")
+                        text = translator.generate(prompt_params={"text": text})
                     stored_translations[split][text] = translated_text
                 
                 prepped_dataset[split].append({
-                    "text": translated_text,
+                    "text": text,
                     "label": labels[i][j]
                 })
     return prepped_dataset
