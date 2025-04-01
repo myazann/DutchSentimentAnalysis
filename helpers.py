@@ -1,4 +1,5 @@
 import random
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 def get_emotion_labels(language="nl"):
 
@@ -166,3 +167,88 @@ def get_few_shot_samples(dataset, args, translator=None):
             few_shot_examples = f"{few_shot_examples}\n{example.strip()}: {key}"
 
     return few_shot_examples
+
+
+def prepare_data(dataset, args, stored_translations, translator):
+
+    prepped_dataset = {}
+    for split in ["train", "validation"]:
+        prepped_dataset[split] = []
+        dialogs = dataset[split]["dialog"]
+        labels = dataset[split]["emotion"]
+        for i in range(len(dialogs)):
+            for j in range(len(dialogs[i])):
+
+                text = dialogs[i][j]
+                if args.language == "nl":
+                    if stored_translations[split].get(text, None) is not None:
+                        text = stored_translations[split][text]
+                    else:
+                        print("Couldn't find translation!")
+                        text = translator.generate(prompt_params={"text": text})
+                    stored_translations[split][text] = text
+                
+                prepped_dataset[split].append({
+                    "text": text,
+                    "label": labels[i][j]
+                })
+    return prepped_dataset
+
+def tokenize_function(args, model, examples):
+    if "LLAMA" in args.model or "FIETJE" in args.model:
+        classifier_prompt = get_classifier_prompt(args.language)
+        
+        # Process each text sample individually
+        formatted_prompts = []
+        for text in examples['text']:
+            # Format the prompt for this individual text sample
+            individual_prompt = model.format_prompt(classifier_prompt, {"text": text, "few_shot_examples": ""})
+            # Apply the chat template to the individual prompt
+            formatted_text = model.tokenizer.apply_chat_template(
+                individual_prompt, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            formatted_prompts.append(formatted_text)
+        
+        # Tokenize all formatted prompts
+        return model.tokenizer(
+            formatted_prompts, 
+            padding="max_length", 
+            truncation=True, 
+            max_length=256, 
+            return_tensors="pt"
+        )
+    elif "BERT" in args.model or "ROBBERT" in args.model or "ROBERTA" in args.model:
+        # For BERT-based models, handle tokenization differently to avoid batch size mismatch
+        tokenized = model.tokenizer(
+            examples['text'],
+            padding="max_length",
+            truncation=True,
+            max_length=256,
+            return_tensors=None  # Don't convert to tensors yet
+        )
+        
+        # Return as individual samples to ensure proper batch handling
+        return tokenized
+    else:
+        # For other models, use the standard tokenization
+        return model.tokenizer(
+            examples['text'], 
+            padding="max_length", 
+            truncation=True, 
+            max_length=256,
+            return_tensors=None  # Don't convert to tensors yet to avoid batch size issues
+        )
+
+def compute_metrics(pred):
+    labels = pred.label_ids
+    preds = pred.predictions.argmax(-1)
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='weighted')
+    acc = accuracy_score(labels, preds)
+    return {
+        'accuracy': acc,
+        'f1': f1,
+        'precision': precision,
+        'recall': recall
+    }

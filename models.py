@@ -19,12 +19,11 @@ from openai import OpenAI
 from anthropic import Anthropic
 import google.generativeai as genai
 
-# Import helpers for emotion labels
 from helpers import get_emotion_labels
 
 class LLM:
 
-    def __init__(self, model_name, default_prompt=None, model_params=None, gen_params=None) -> None:
+    def __init__(self, model_name, default_prompt=None, model_params=None, gen_params=None, use_lora=False, finetuned=False) -> None:
         
         login(token=os.getenv("HF_API_KEY"), new_session=False)
         self.cfg = LLM.get_cfg()[model_name]
@@ -38,6 +37,8 @@ class LLM:
         self.tokenizer = self.init_tokenizer()
         self.model_params = self.get_model_params(model_params)
         self.gen_params = self.get_gen_params(gen_params)
+        self.use_lora = use_lora
+        self.finetuned = finetuned
         self.model = self.init_model()
         self.default_prompt = default_prompt if default_prompt is not None else []
 
@@ -54,8 +55,6 @@ class LLM:
             return "GROQ"
         elif self.model_name.endswith("GGUF"):
             return "GGUF"
-        elif self.model_name.endswith("FINETUNED"):
-            return "FINETUNED"
         elif self.cfg.get("provider"):
             return self.cfg.get("provider")  
         else:
@@ -174,30 +173,24 @@ class LLM:
                 len_files = len(os.listdir(model_path))
                 model_path = f"{model_path}/{self.file_name}-00001-of-0000{len_files}.gguf"
             return Llama(model_path=model_path, **self.model_params)
-        elif self.provider == "FINETUNED":
+        elif self.finetuned and "instruct" not in self.repo_id:
+            from peft import PeftModel
+            
             final_path = os.path.join(self.finetune_path, "final_model")
             if os.path.exists(final_path):
                 # Check if this is a LLaMA model
                 if "LLAMA" in self.model_name:                    
-                    model_size_str = self.model_name.split("-")[-2]  # Get size part (e.g., "3B" from "LLAMA-3B-FINETUNED")
-                    is_large_model = False
-                    if model_size_str.endswith("B"):
-                        try:
-                            model_size = float(model_size_str[:-1])
-                            is_large_model = model_size > 1.0
-                            print(f"Model size: {model_size}B, Using quantization: {is_large_model}")
-                        except ValueError:
-                            # If we can't parse the size, assume it's not a large model
-                            pass
-                    
                     # Check if this is a LoRA adapter by looking for adapter_config.json
                     adapter_config_path = os.path.join(final_path, "adapter_config.json")
                     is_lora_adapter = os.path.exists(adapter_config_path)
                     
-                    if is_lora_adapter:
-                        print(f"Detected LoRA adapter at {adapter_config_path}")
+                    # Apply LoRA if explicitly enabled via use_lora parameter AND adapter exists
+                    if is_lora_adapter and self.use_lora:
+                        print(f"Using LoRA adapter at {adapter_config_path} (use_lora={self.use_lora})")
 
-                        if is_large_model and torch.cuda.is_available():
+                        # Apply quantization when using LoRA for better memory efficiency
+                        quantization_config = None
+                        if torch.cuda.is_available():
                             quantization_config = BitsAndBytesConfig(
                                 load_in_4bit=True,
                                 bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
@@ -225,31 +218,18 @@ class LLM:
                             is_trainable=False 
                         )
                     else:
-                        # For regular fine-tuned models (not LoRA adapters)
-                        if is_large_model and torch.cuda.is_available():
-                            # For larger models, check if we need to load with quantization
-                            quantization_config = BitsAndBytesConfig(
-                                load_in_4bit=True,
-                                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-                                bnb_4bit_use_double_quant=True,
-                                bnb_4bit_quant_type="nf4",
-                            )
-                            
-                            model = AutoModelForSequenceClassification.from_pretrained(
-                                final_path, 
-                                **self.model_params,
-                                quantization_config=quantization_config,
-                                device_map="auto",
-                                torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-                            )
-                        else:
-                            # For smaller models, load normally
-                            model = AutoModelForSequenceClassification.from_pretrained(
-                                final_path, 
-                                **self.model_params,
-                                torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32,
-                                low_cpu_mem_usage=True
-                            )
+                        # Either LoRA is disabled or adapter doesn't exist
+                        if is_lora_adapter and not self.use_lora:
+                            print(f"LoRA adapter found but not used (use_lora={self.use_lora})")
+                        
+                        # For regular fine-tuned models (not using LoRA adapters)
+                        # No quantization is applied if not using LoRA
+                        model = AutoModelForSequenceClassification.from_pretrained(
+                            final_path, 
+                            **self.model_params,
+                            torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32,
+                            low_cpu_mem_usage=True
+                        )
                 else:
                     model = AutoModelForSequenceClassification.from_pretrained(final_path, **self.model_params)
             else:
@@ -287,7 +267,7 @@ class LLM:
                     low_cpu_mem_usage=True)
 
     def format_prompt(self, prompt, params=None):
-        if self.provider == "FINETUNED":
+        if self.finetuned and "instruct" not in self.repo_id:
             return params.get("text", "")
 
         if not prompt:
@@ -453,7 +433,7 @@ class LLM:
             )
             output = response.text 
 
-        elif self.provider == "FINETUNED" and "instruct" not in self.repo_id:
+        elif self.finetuned and "instruct" not in self.repo_id:
             text = prompt_params.get("text", "")
             inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
             device = next(self.model.parameters()).device

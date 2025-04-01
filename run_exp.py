@@ -24,7 +24,10 @@ if args.few_k == 0:
 
 # llm_list = ["GPT-4o-mini"]
 translator = None
-llm_list = ["LLAMA-3B-FINETUNED", "FIETJE-2-CHAT-FINETUNED", "LLAMA-1B-FINETUNED", "ROBBERT-V2-EMOTION-FINETUNED", "QWEN-2.5-72B-GGUF", "LLAMA-3.3-70B-GGUF", "QWEN-2.5-14B-GGUF"]
+# Update model names to remove FINETUNED suffix where needed
+llm_list = ["XLM-ROBERTA-BASE", "MULTILINGUAL-BERT", "LLAMA-3.2-3B", "FIETJE-2-CHAT", "LLAMA-3.2-1B", "ROBBERT-V2-EMOTION", "QWEN-2.5-72B-GGUF", "LLAMA-3.3-70B-GGUF"]
+# Keep track of which models need finetuned=True
+finetuned_models = ["XLM-ROBERTA-BASE", "MULTILINGUAL-BERT", "LLAMA-3.2-3B", "FIETJE-2-CHAT", "LLAMA-3.2-1B", "ROBBERT-V2-EMOTION"]
 
 if args.language == "nl":
     translator_model_name = "GPT-4o-mini"
@@ -57,11 +60,17 @@ emotion_labels_inverse = get_emotion_labels_inverse(args.language)
 print(f"Language: {args.language}, Few shot k: {args.few_k}, Proportional: {args.proportional}")
 
 for model_name in llm_list:
-    if args.few_k > 0 and "FINETUNED" in model_name:
+    # Skip finetuned models when using few-shot
+    if args.few_k > 0 and model_name in finetuned_models:
         continue
-        
-    exp_name = f"preds_{model_name}_{args.language}_k({args.few_k})_p({args.proportional})"
-    print(f"\n{model_name}")
+    
+    # Determine if we should use the finetuned version    
+    use_finetuned = model_name in finetuned_models
+    
+    # Use the original names for experiment tracking
+    exp_model_name = f"{model_name}-FINETUNED" if use_finetuned else model_name
+    exp_name = f"preds_{exp_model_name}_{args.language}_k({args.few_k})_p({args.proportional})"
+    print(f"\n{exp_model_name}")
   
     all_res = []
 
@@ -71,9 +80,9 @@ for model_name in llm_list:
         if len(all_res) == len(daily_dialog_test):
             continue
 
-    if "FINETUNED" in model_name:
+    if use_finetuned:
         if "ROBBERT" in model_name:
-            classifier = LLM(model_name, model_params={"num_labels": 7, "ignore_mismatched_sizes": True})
+            classifier = LLM(model_name, model_params={"num_labels": 7, "ignore_mismatched_sizes": True}, finetuned=True)
         else:
             is_large_model = False
             
@@ -96,11 +105,11 @@ for model_name in llm_list:
                 is_large_model = False
             
             if is_large_model and torch.cuda.is_available():
-                base_model = LLM(model_name, default_prompt=get_classifier_prompt(args.language))
+                base_model = LLM(model_name, default_prompt=get_classifier_prompt(args.language), finetuned=True)
 
                 # Check if the model is a LoRA adapter by looking for adapter_config.json
                 finetune_path = os.path.join("finetune", base_model.repo_id.split("/")[-1], "final_model")
-                adapter_config_path = os.path.join(finetune_path, "final_model", "adapter_config.json")
+                adapter_config_path = os.path.join(finetune_path, "adapter_config.json")
                 is_lora_adapter = os.path.exists(adapter_config_path)
 
                 if is_lora_adapter:
@@ -123,16 +132,16 @@ for model_name in llm_list:
                     
                     classifier_model = PeftModel.from_pretrained(
                         quantized_model,
-                        os.path.join(finetune_path, "final_model"),
+                        finetune_path,
                         is_trainable=False  # Set to False for inference
                     )
                     
                     base_model.model = classifier_model
                     classifier = base_model
                 else:
-                    classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language), model_params={"num_labels": 7, "ignore_mismatched_sizes": True})
+                    classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language), model_params={"num_labels": 7, "ignore_mismatched_sizes": True}, finetuned=True)
             else:
-                classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language), model_params={"num_labels": 7, "ignore_mismatched_sizes": True})
+                classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language), model_params={"num_labels": 7, "ignore_mismatched_sizes": True}, finetuned=True)
     else:
         classifier = LLM(model_name, default_prompt=get_classifier_prompt(args.language))
 
@@ -160,7 +169,7 @@ for model_name in llm_list:
             else:
                 text = turn
             try:
-                if classifier.provider == "FINETUNED":
+                if use_finetuned and "instruct" not in model_name:
                     pred = classifier.generate(prompt_params={"text": text, "language": args.language})
                 else:
                     pred = classifier.generate(prompt_params={"text": text, "few_shot_examples": few_shot_examples})

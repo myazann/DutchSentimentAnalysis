@@ -3,18 +3,17 @@ import os
 import json
 import subprocess
 from datasets import load_dataset, Dataset, DatasetDict
-from transformers import TrainingArguments, Trainer, AutoModelForSequenceClassification, BitsAndBytesConfig, DataCollatorWithPadding
+from transformers import TrainingArguments, Trainer, AutoModelForSequenceClassification, BitsAndBytesConfig, DataCollatorWithPadding, AutoTokenizer
 from transformers.integrations import WandbCallback, TensorBoardCallback
 from transformers.trainer_callback import EarlyStoppingCallback, TrainerCallback
 import logging
 import numpy as np
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import wandb
 import torch
 from torch.utils.data import DataLoader
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 
-from helpers import get_emotion_labels, get_translate_prompt, get_classifier_prompt
+from helpers import get_emotion_labels, get_translate_prompt, get_classifier_prompt, tokenize_function, prepare_data, compute_metrics
 from models import LLM
 
 logging.basicConfig(
@@ -24,22 +23,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("-m", "--model", default="ROBBERT-V2-EMOTION-FINETUNED", type=str)
+parser.add_argument("-m", "--model", default="ROBBERT-V2-EMOTION", type=str)
 parser.add_argument("-lg", "--language", default="nl", type=str)
 parser.add_argument("-wp", "--wandb_project", default="dutch-sentiment", type=str)
 parser.add_argument("-wn", "--wandb_name", default="robbert-emotion", type=str)
+parser.add_argument("--use_lora", action="store_true", help="Enable LoRA fine-tuning for compatible models.")
 args = parser.parse_args()
 
 learning_rate = 2e-5
 weight_decay = 0.01
 warmup_ratio = 0.1
-num_epochs = 5
+num_epochs = 10
 max_grad_norm = 1.0
-gradient_accumulation_steps = 4
+gradient_accumulation_steps = 1
+
+quantization_config = None
+lora_config = None
 
 translator_model_name = "GPT-4o-mini"
 translator = LLM(translator_model_name, default_prompt=get_translate_prompt())
 
+stored_translations = {}
 if args.language == "nl":
     translations_file = os.path.join("files", f"translations_{translator_model_name}_{args.language}.json")
     if os.path.exists(translations_file):
@@ -50,72 +54,7 @@ if args.language == "nl":
 
 dataset = load_dataset("li2017dailydialog/daily_dialog")
 
-def prepare_data(dataset):
-
-    prepped_dataset = {}
-    for split in ["train", "validation"]:
-        prepped_dataset[split] = []
-        dialogs = dataset[split]["dialog"]
-        labels = dataset[split]["emotion"]
-        for i in range(len(dialogs)):
-            for j in range(len(dialogs[i])):
-
-                text = dialogs[i][j]
-                if args.language == "nl":
-                    if stored_translations[split].get(text, None) is not None:
-                        text = stored_translations[split][text]
-                    else:
-                        print("Couldn't find translation!")
-                        text = translator.generate(prompt_params={"text": text})
-                    stored_translations[split][text] = translated_text
-                
-                prepped_dataset[split].append({
-                    "text": text,
-                    "label": labels[i][j]
-                })
-    return prepped_dataset
-
-def tokenize_function(model, examples):
-    if "LLAMA" in args.model or "FIETJE" in args.model:
-        classifier_prompt = get_classifier_prompt(args.language)
-        
-        # Process each text sample individually
-        formatted_prompts = []
-        for text in examples['text']:
-            # Format the prompt for this individual text sample
-            individual_prompt = model.format_prompt(classifier_prompt, {"text": text, "few_shot_examples": ""})
-            # Apply the chat template to the individual prompt
-            formatted_text = model.tokenizer.apply_chat_template(
-                individual_prompt, 
-                tokenize=False, 
-                add_generation_prompt=True
-            )
-            formatted_prompts.append(formatted_text)
-        
-        # Tokenize all formatted prompts
-        return model.tokenizer(
-            formatted_prompts, 
-            padding="max_length", 
-            truncation=True, 
-            max_length=256, 
-            return_tensors="pt"
-        )
-    else:
-        return model.tokenizer(examples['text'], padding="max_length", truncation=True, max_length=256)
-
-def compute_metrics(pred):
-    labels = pred.label_ids
-    preds = pred.predictions.argmax(-1)
-    precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='weighted')
-    acc = accuracy_score(labels, preds)
-    return {
-        'accuracy': acc,
-        'f1': f1,
-        'precision': precision,
-        'recall': recall
-    }
-
-dataset = prepare_data(dataset)
+dataset = prepare_data(dataset, args, stored_translations, translator)
 dataset = DatasetDict({
     split: Dataset.from_list(examples) 
     for split, examples in dataset.items()
@@ -130,7 +69,7 @@ model_params = {
 
 if "LLAMA" in args.model or "FIETJE" in args.model:
     cuda_available = torch.cuda.is_available()
-    model = LLM(args.model, model_params=model_params)
+    model = LLM(args.model, model_params=model_params, use_lora=args.use_lora)
     
     if model.tokenizer.pad_token is None:
         if model.tokenizer.eos_token is not None:
@@ -142,24 +81,10 @@ if "LLAMA" in args.model or "FIETJE" in args.model:
     
     print(f"Padding token: {model.tokenizer.pad_token}, ID: {model.tokenizer.pad_token_id}")
     
-    # Check if model requires quantization based on min_GPU_RAM from config
-    is_large_model = False
-    model_cfg = LLM.get_cfg()[args.model]
-    min_gpu_ram = model_cfg.get("min_GPU_RAM")
-    
-    if min_gpu_ram is not None:
-        try:
-            min_gpu_ram = int(min_gpu_ram)
-            is_large_model = min_gpu_ram >= 10
-            print(f"Model min_GPU_RAM: {min_gpu_ram}GB, Using quantization: {is_large_model}")
-        except (ValueError, TypeError):
-            is_large_model = False
-            print("Could not determine min_GPU_RAM, not using quantization")
-    else:
-        print("No min_GPU_RAM specified in config, not using quantization")
-    
-    if is_large_model and cuda_available:
-        print("Using 4-bit quantization for large model")
+    # Determine quantization based on use_lora setting and CUDA availability
+    quantization_config = None
+    if args.use_lora and cuda_available:
+        print("Using 4-bit quantization with LoRA")
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
@@ -167,9 +92,8 @@ if "LLAMA" in args.model or "FIETJE" in args.model:
             bnb_4bit_quant_type="nf4",
         )
     else:
-        quantization_config = None
         print("Not using quantization")
-    
+
     try:
         # First try loading with CUDA and quantization if applicable
         print(f"Loading model from {model.repo_id}")
@@ -183,38 +107,42 @@ if "LLAMA" in args.model or "FIETJE" in args.model:
             low_cpu_mem_usage=True,
             device_map="auto" if cuda_available else None  # Explicitly use device_map="auto" for GPU
         )
-        
-        # If using quantization, apply LoRA adapters
-        if is_large_model and cuda_available:
-            print("Applying LoRA adapters for quantized model")
-            # Prepare the model for k-bit training
-            classification_model = prepare_model_for_kbit_training(
-                classification_model,
-                use_gradient_checkpointing=True
-            )
-            
+
+        # Apply LoRA adapters if requested and model is compatible
+        if args.use_lora and ("LLAMA" in args.model or "FIETJE" in args.model):
+            print("Applying LoRA adapters as requested")
+            # Prepare the model for k-bit training *if* quantization is enabled
+            if quantization_config is not None:
+                print("Preparing model for k-bit training before applying LoRA")
+                classification_model = prepare_model_for_kbit_training(
+                    classification_model,
+                    use_gradient_checkpointing=True # Recommended with LoRA
+                )
+
             # Configure LoRA
             lora_config = LoraConfig(
                 r=16,  # Rank dimension
                 lora_alpha=64,  # Alpha parameter for LoRA scaling
                 target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-                lora_dropout=0.05,
-                bias="none",
-                task_type=TaskType.SEQ_CLS
+                task_type=TaskType.SEQ_CLS, # Specify task type for sequence classification
+                lora_dropout=0.1, # Add dropout for regularization
+                bias="none"
             )
-            
-            # Apply LoRA adapters
+
+            # Get PEFT model with LoRA configuration
             classification_model = get_peft_model(classification_model, lora_config)
             classification_model.print_trainable_parameters()
-            
-            # Explicitly move model to GPU and verify device
+
+            # Explicitly move model to GPU and verify device (redundant with device_map='auto' but good check)
             if cuda_available:
                 device = torch.device("cuda")
                 classification_model = classification_model.to(device)
                 # Check if model is actually on GPU
-                print(f"Model device check - Is model on CUDA: {next(classification_model.parameters()).is_cuda}")
-                print(f"Model device: {next(classification_model.parameters()).device}")
-        
+                print(f"Model device check after LoRA - Is model on CUDA: {next(classification_model.parameters()).is_cuda}")
+                print(f"Model device after LoRA: {next(classification_model.parameters()).device}")
+        else:
+             print("LoRA not enabled or model not compatible.")
+
         # Set padding token in the model config
         if classification_model.config.pad_token_id is None:
             if model.tokenizer.pad_token_id is not None:
@@ -249,8 +177,39 @@ if "LLAMA" in args.model or "FIETJE" in args.model:
             )
         else:
             raise e
-else:
+elif "BERT" in args.model or "ROBBERT" in args.model or "ROBERTA" in args.model:
+    # For BERT-based models, we'll use the direct approach since these models
+    # are natively designed for classification, not generative tasks
+    cuda_available = torch.cuda.is_available()
+    
+    print(f"Loading BERT-based model: {args.model}")
+    
+    # Initialize the model directly with AutoModelForSequenceClassification 
+    # instead of going through LLM class to avoid tokenization issues
+    repo_id = LLM.get_cfg()[args.model].get("repo_id")
+    print(f"Using repo_id: {repo_id}")
+    
+    # Get the tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(repo_id, use_fast=True)
+    
+    # Load the model
+    classification_model = AutoModelForSequenceClassification.from_pretrained(
+        repo_id,
+        num_labels=num_labels,
+        ignore_mismatched_sizes=True,
+        problem_type="single_label_classification"
+    )
+    
+    # Move to GPU if available
+    if cuda_available:
+        classification_model = classification_model.to(torch.device("cuda"))
+    
+    # Create a simplified LLM wrapper with just what we need
     model = LLM(args.model, model_params=model_params)
+    model.tokenizer = tokenizer
+    model.model = classification_model
+else:
+    model = LLM(args.model, model_params=model_params, use_lora=args.use_lora)
 
 logger.info(f"Number of unique labels in dataset: {num_labels}")
 
@@ -261,7 +220,7 @@ os.makedirs(cache_dir, exist_ok=True)
 logger.info("Tokenizing datasets (this may take a while)...")
 num_proc = min(os.cpu_count() // 2, 4)  # Use half of available CPUs but max 4
 tokenized_datasets = dataset.map(
-    lambda examples: tokenize_function(model, examples), 
+    lambda examples: tokenize_function(args, model, examples), 
     batched=True,
     batch_size=1024,  
     num_proc=num_proc,  
@@ -303,7 +262,7 @@ num_train_samples = len(tokenized_datasets["train"])
 # Determine optimal batch size based on model
 if "LLAMA" in args.model or "FIETJE" in args.model:
     # Check if we're using quantization to determine batch size
-    if is_large_model and cuda_available:
+    if args.use_lora and cuda_available:
         batch_size = 128 
     else:
         batch_size = 16
@@ -332,18 +291,18 @@ training_args = TrainingArguments(
     save_strategy="steps",
     save_steps=500,
     save_total_limit=3,
-    fp16=is_large_model and cuda_available,  # Enable fp16 for quantized models
-    bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported() and not (is_large_model and cuda_available),  # Don't use bf16 with 4-bit quantization
+    fp16=args.use_lora and cuda_available,  # Enable fp16 for quantized models
+    bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported() and not (args.use_lora and cuda_available),  # Don't use bf16 with 4-bit quantization
     logging_steps=100,  
     report_to="wandb",
     warmup_steps=warmup_steps,
     gradient_accumulation_steps=gradient_accumulation_steps,
     max_grad_norm=max_grad_norm,
-    gradient_checkpointing=True if "LLAMA" in args.model or "FIETJE" in args.model else False,
+    gradient_checkpointing=args.use_lora, # Enable GC only if LoRA is used
     lr_scheduler_type="cosine",  
     dataloader_num_workers=num_proc,  
     dataloader_pin_memory=True,  
-    optim="paged_adamw_8bit" if (is_large_model and cuda_available) else "adamw_torch",  # Use 8-bit optimizer with quantization
+    optim="paged_adamw_8bit" if (args.use_lora and cuda_available) else "adamw_torch",  # Use 8-bit optimizer with quantization
     run_name=f"{args.model.split('/')[-1]}-{args.language}-emotion-{wandb_name}",
     no_cuda=False,
     ddp_find_unused_parameters=False, 
@@ -409,7 +368,7 @@ class CheckpointSafetyCallback(TrainerCallback):
 # Create a custom data collator that handles padding efficiently
 
 # Create appropriate data collator based on whether we're using quantization
-if ("LLAMA" in args.model or "FIETJE" in args.model) and is_large_model and cuda_available:
+if ("LLAMA" in args.model or "FIETJE" in args.model) and args.use_lora and cuda_available:
     print("Using DataCollatorWithPadding with 4-bit quantization compatibility")
     # For quantized models, we need to ensure we don't convert tensors to float16/bfloat16
     # as this would break the quantization
@@ -432,7 +391,7 @@ trainer = Trainer(
     compute_metrics=compute_metrics,
     data_collator=data_collator, 
     callbacks=[
-        EarlyStoppingCallback(early_stopping_patience=5),
+        EarlyStoppingCallback(early_stopping_patience=10),
         WandbCallback(),
         LearningRateLoggerCallback(),
         GPUStatsCallback(),
@@ -443,7 +402,31 @@ trainer = Trainer(
 try:
     # Before training, ensure the output directory exists
     os.makedirs(training_args.output_dir, exist_ok=True)
-    
+
+    # --- Log additional hyperparameters to wandb ---
+    if trainer.is_local_process_zero(): # Ensure logging happens only on main process
+        additional_hyperparameters = {
+            "script_args": vars(args),
+            "translator_model_name": translator_model_name,
+            "calculated_batch_size": batch_size,
+            "num_unique_labels": num_labels,
+            "quantization_config": quantization_config.to_dict() if quantization_config else None,
+            "uses_lora_arg": args.use_lora, # Log the command line arg
+            "lora_config": lora_config.to_dict() if lora_config else None,
+            "hardcoded_lr": learning_rate,
+            "hardcoded_wd": weight_decay,
+            "hardcoded_warmup_ratio": warmup_ratio,
+            "hardcoded_num_epochs": num_epochs,
+            "hardcoded_max_grad_norm": max_grad_norm,
+            "hardcoded_grad_accum": gradient_accumulation_steps
+        }
+        # Check if wandb run exists (initialized by Trainer/WandbCallback)
+        if wandb.run:
+            wandb.config.update(additional_hyperparameters, allow_val_change=True)
+            logger.info(f"Updated wandb config with additional hyperparameters: {list(additional_hyperparameters.keys())}")
+        else:
+            logger.warning("Wandb run not initialized, cannot log additional hyperparameters.")
+
     # Start training
     logger.info("Starting training...")
     trainer.train()
@@ -453,7 +436,7 @@ try:
     os.makedirs(final_model_path, exist_ok=True)
     
     # For quantized models with LoRA, save adapters separately
-    if ("LLAMA" in args.model or "FIETJE" in args.model) and is_large_model and cuda_available:
+    if ("LLAMA" in args.model or "FIETJE" in args.model) and args.use_lora and cuda_available:
         logger.info("Saving LoRA adapters for quantized model...")
         # Save only the LoRA adapters
         model.model.save_pretrained(final_model_path)
